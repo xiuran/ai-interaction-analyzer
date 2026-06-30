@@ -1,0 +1,25 @@
+# User custom config (use custom_patterns.example.json as template)
+config/custom_patterns.json
+
+# Analysis output
+output/
+*.jsonl
+!config/*.example.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

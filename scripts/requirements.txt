@@ -1,0 +1,6 @@
+# AI Interaction Analyzer
+# Zero external dependencies — stdlib only
+# Python >= 3.8
+#
+# Used stdlib modules:
+# json, os, re, sys, argparse, collections, datetime, pathlib, statistics, sqlite3, glob

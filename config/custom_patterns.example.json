@@ -1,0 +1,26 @@
+{
+  "_comment": "Custom configuration template. Copy to custom_patterns.json and modify as needed.",
+  "_usage": "analyzer.py auto-loads custom_patterns.json (if it exists) from ~/.config/ai-interaction-analyzer/ or the config/ directory.",
+
+  "extra_confirmations": [
+    "Example: add your common short confirmation phrases here to avoid false-positive low-quality detection"
+  ],
+
+  "extra_followups": [
+    "Example: add your common follow-up sentence patterns here (regex supported)"
+  ],
+
+  "extra_negations": [
+    "Example: add your unique negation/redo expressions here"
+  ],
+
+  "custom_task_keywords": {
+    "example-task-type": "keyword1|keyword2|keyword3"
+  },
+
+  "ignored_projects": [
+    "Example: project names you don't want analyzed"
+  ],
+
+  "report_language": "en"
+}
