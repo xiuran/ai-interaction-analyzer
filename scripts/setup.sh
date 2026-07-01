@@ -126,26 +126,11 @@ detect_sources() {
         echo "○  Cursor          — not detected"
     fi
 
-    local cline_dir=$(find "$HOME/.vscode/extensions" -maxdepth 1 -name "saoudrizwan.claude-dev-*" 2>/dev/null | head -1)
-    if [[ -n "$cline_dir" ]]; then
-        echo "✅ Cline           — detected"
+    if [[ -d "$HOME/.qoder" ]]; then
+        echo "✅ Qoder           — detected"
         found=$((found + 1))
     else
-        echo "○  Cline           — not detected"
-    fi
-
-    if [[ -d "$HOME/.gemini" ]]; then
-        echo "✅ Gemini CLI      — detected"
-        found=$((found + 1))
-    else
-        echo "○  Gemini CLI      — not detected"
-    fi
-
-    if [[ -d "$HOME/.config/github-copilot" ]]; then
-        echo "✅ GitHub Copilot  — detected"
-        found=$((found + 1))
-    else
-        echo "○  GitHub Copilot  — not detected"
+        echo "○  Qoder           — not detected"
     fi
 
     echo ""
@@ -162,7 +147,7 @@ verify_run() {
     echo ""
     echo "── Verification ────────────────────────────────"
     echo ""
-    python3 "$SKILL_DIR/scripts/analyzer.py" --mode=setup 2>/dev/null && echo "" && echo "✅ Analysis engine running OK" || echo "❌ Run failed, check Python environment"
+    python3 "$SKILL_DIR/scripts/analyzer.py" --mode=scope 2>/dev/null && echo "" && echo "✅ Analysis engine running OK" || echo "❌ Run failed, check Python environment"
 }
 
 # ─── Main ────────────────────────────────────────────────────
@@ -186,7 +171,7 @@ main() {
             echo "═══════════════════════════════════════════════"
             echo "  Setup complete! Usage:"
             echo "  - In Claude Code: type /ai-trace"
-            echo "  - CLI: python3 $SKILL_DIR/scripts/analyzer.py --days=7"
+            echo "  - CLI: python3 $SKILL_DIR/scripts/analyzer.py --mode=analyze"
             echo "═══════════════════════════════════════════════"
             ;;
     esac

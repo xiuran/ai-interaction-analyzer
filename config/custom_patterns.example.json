@@ -1,26 +1,26 @@
 {
-  "_comment": "Custom configuration template. Copy to custom_patterns.json and modify as needed.",
-  "_usage": "analyzer.py auto-loads custom_patterns.json (if it exists) from ~/.config/ai-interaction-analyzer/ or the config/ directory.",
+  "_comment": "自定义配置模板。复制为 custom_patterns.json 后按需修改。",
+  "_usage": "analyzer.py 会自动从 ~/.config/ai-interaction-analyzer/ 或 config/ 目录加载 custom_patterns.json（如果存在）。",
 
   "extra_confirmations": [
-    "Example: add your common short confirmation phrases here to avoid false-positive low-quality detection"
+    "示例：在这里添加你常用的简短确认短语，避免被误判为低质量 prompt"
   ],
 
   "extra_followups": [
-    "Example: add your common follow-up sentence patterns here (regex supported)"
+    "示例：在这里添加你常用的追问句式（支持正则）"
   ],
 
   "extra_negations": [
-    "Example: add your unique negation/redo expressions here"
+    "示例：在这里添加你独特的否定/重做表达方式"
   ],
 
   "custom_task_keywords": {
-    "example-task-type": "keyword1|keyword2|keyword3"
+    "示例任务类型": "关键词1|关键词2|关键词3"
   },
 
   "ignored_projects": [
-    "Example: project names you don't want analyzed"
+    "示例：不想被分析的项目名"
   ],
 
-  "report_language": "en"
+  "report_language": "zh"
 }

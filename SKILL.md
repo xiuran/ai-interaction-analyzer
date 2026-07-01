@@ -1,175 +1,179 @@
 ---
 name: ai-interaction-analyzer
 description: |
-  Multi-round cyclic analysis of user conversations with AI coding tools
-  (Claude Code / Cursor / Codex / Cline / Copilot / Gemini CLI, etc.).
-  Scans inputs for signals first, then reads context for deeper analysis,
-  looping until no new findings remain.
-  Output: installable Prompt Rules + Best Practices, not a stats report.
-  Triggers: "/ai-trace", "analyze my AI conversations", "AI collaboration analysis",
-  "prompt quality", "look at my AI chat issues".
+  读取你本地的 AI 对话记录（Claude Code / Codex / Qoder / Cursor），
+  自动发现"AI 反复踩的坑"和"你已经验证有效的协作方式"，
+  直接生成可安装到 CLAUDE.md / AGENTS.md / .cursorrules 的规则——装上就生效，不用自己总结。
+  分析范围覆盖编码、排查、文档、方案设计、知识沉淀等所有类型的 AI 协作。
+  触发："/ai-trace"、"分析我的 AI 对话"、"AI 协作分析"、"prompt 质量"、"看看我和 AI 聊天的问题"。
 ---
 
 # AI Interaction Analyzer
 
-Analyze your real conversation logs through multi-round cyclic analysis to find AI problem patterns and success patterns, producing collaboration rules that can be directly installed into any AI tool.
+从你真实的 AI 对话中（编码、排查、写文档、方案设计、知识沉淀……所有场景），挖掘出 AI 反复犯的错误模式和你已经验证有效的协作方式，产出可一键安装的规则——让 AI 不再重复踩坑。
 
 ---
 
-## When to Use
+## 触发条件
 
-Trigger when the user shows any of these intents:
-- "Analyze my AI conversation quality"
-- "How is my prompt quality lately"
+出现以下意图时触发：
+- "分析一下我的 AI 对话质量"
+- "最近我的 prompt 质量怎么样"
 - "/ai-trace"
-- "Analyze my Cursor/Claude Code/Codex usage"
+- "分析一下我用 Cursor / Claude Code / Codex 的情况"
 
 ---
 
-## Input Validation
+## 前置检查
 
-| Check | Pass Condition | Failure Handling |
-|-------|---------------|-----------------|
-| At least one data source exists | See "Supported Data Sources" | Inform user of detected source status |
-| Python 3.8+ available | `python3 --version` | Run `setup.sh` for auto-install |
+| 检查项 | 通过条件 | 失败处理 |
+|--------|---------|---------|
+| 至少一个数据源存在 | 见"支持的数据源" | 告知用户各数据源的检测状态 |
+| Python 3.8+ 可用 | `python3 --version` | 运行 `setup.sh` 自动安装 |
 
 ---
 
-## Supported Data Sources
+## 支持的数据源
 
-| Tool | Prompt Index | Full Conversation (incl. AI replies) |
-|------|-------------|-------------------------------------|
-| Claude Code | `~/.claude/history.jsonl` | `~/.claude/projects/*/*.jsonl` |
-| Codex | `~/.codex/history.jsonl` | `~/.codex/sessions/**/*.jsonl` |
-| Cursor | `~/Library/Application Support/Cursor/` | Session files in same directory |
-| Cline/Roo | `~/.vscode/extensions/saoudrizwan.claude-dev-*/` | globalStorage |
-| Copilot | `~/.config/github-copilot/` | Same directory |
-| Gemini CLI | `~/.gemini/history/` | Same directory |
+| 工具 | 支持程度 | 数据路径 | 分析内容 |
+|------|---------|---------|--------|
+| Claude Code | 完整支持 | `~/.claude/` | prompt 历史 + 完整 session 上下文 + 模型统计 |
+| Codex | 完整支持 | `~/.codex/` | 历史 + rollout 上下文 + 模型统计 |
+| Qoder | 完整支持 | `~/.qoder/` | JSONL transcript + 模型信息 |
+| Cursor | 尽力解析 | `~/Library/.../Cursor/` | SQLite 数据库（schema 跨版本不稳定） |
 
 <HARD-GATE>
-Read-only local analysis. No data upload, no modification of user data.
+纯本地只读分析。不上传数据，不修改用户数据。
 </HARD-GATE>
 
 ---
 
-## Execution Flow — Multi-Round Cyclic Analysis
+## 执行流程 — 多轮循环分析
 
-The overall flow has 4 stages. Stages 2-3 loop until no new findings.
+整体分 4 个阶段。阶段 2-3 循环执行直到没有新发现。
 
-### Stage 0: Determine Analysis Scope
+### 阶段 0：确定分析范围
 
 ```bash
 python3 <SKILL_DIR>/scripts/analyzer.py --mode=scope
 ```
 
-The script scans data sources and returns data volumes for each time range.
+脚本扫描数据源，返回各时间范围的数据量。
 
-Scope rules (first match wins):
-1. Last 30 days prompts > 500 → shrink to 15 days (too much data hurts quality)
-2. Last 30 days prompts < 50 → expand to 60 days (too few for pattern extraction)
-3. Otherwise → 30 days
+范围规则（首条命中即止）：
+1. 用户明确要求"全部日期/全量/所有数据" → 不传 `--days` 参数（分析全部数据）
+2. 近 60 天 prompt > 3000 → 缩小到 30 天（数据太多影响质量）
+3. 近 60 天 prompt < 300 → 扩大到 180 天（数据太少提取不出模式）
+4. 否则 → 60 天
 
-Inform the user of the analysis scope, then begin.
+告知用户分析范围后开始。
 
-### Stage 1: Layer 1 — Scan Inputs, Extract Signals
+注意：`--days` 不传时 analyzer.py 默认分析全部数据（不做时间过滤）。
+
+### 阶段 1：Layer 1 — 扫描输入，提取信号
 
 ```bash
 python3 <SKILL_DIR>/scripts/analyzer.py --mode=signals --days=<N>
 ```
 
-The script scans all prompt text, extracting by category:
-- **Frustration signals**: User corrections of AI (fabrication/mistakes/poor quality/overreach/repeated errors)
-- **Positive signals**: User approval of AI (praise/trust delegation/solution reuse)
-- **Successful sessions**: ≤ 5 turns, no negations
+脚本扫描全部 prompt 文本，按类别提取：
+- **挫折信号**：用户纠正 AI（编造 / 做错 / 不认真 / 越权 / 重复犯错）
+- **正面信号**：用户认可 AI（夸赞 / 信任委托 / 复用方案）
+- **成功 session**：≤ 5 轮，无否定词
 
-Output: list of incidents for deep analysis + list of successful sessions worth extracting.
+输出：待深入分析的 incident 列表 + 值得提炼的成功 session 列表。
 
-### Stage 2: Layer 2 — Read Context, Deep Analysis (Loop)
+### 阶段 2：Layer 2 — 读取上下文，深度分析（循环）
 
-For each incident / successful session, read ±4 turns of full conversation around the complaint/success point:
+对每个 incident / 成功 session，读取投诉点/成功点前后 ±4 轮完整对话：
 
 ```bash
 python3 <SKILL_DIR>/scripts/analyzer.py --mode=context --session=<SID> --prompt="<TEXT>"
 ```
 
-AI reads context and analyzes:
-- **What AI did**: tool calls, output content
-- **Why it failed / succeeded**: root cause
-- **How user corrected / why they approved**: correction direction
-- **Whether to go deeper**: does this incident relate to other sessions?
+AI 读取上下文后分析：
+- **AI 做了什么**：工具调用、输出内容
+- **为什么失败/成功**：根因
+- **用户如何纠正/为什么认可**：纠正方向
+- **是否需要继续深入**：这个 incident 是否关联其他 session？
 
 <HARD-GATE>
-Context reading limited to ±4 turns around the complaint/success point (8 turns total).
-Never read entire sessions to avoid token explosion.
+上下文读取限制在投诉点/成功点前后 ±4 轮（共 8 轮）。
+禁止读取整个 session，避免 token 爆炸。
 </HARD-GATE>
 
-### Stage 3: Continue or Stop (Loop Exit)
+### 阶段 3：继续或停止（循环出口）
 
-After each Layer 2 round, evaluate whether to continue:
+每轮 Layer 2 结束后判断是否继续：
 
-Priority rules (first match wins):
-1. Found new problem patterns not covered → continue, read more incidents
-2. Same issue type across multiple projects → continue, compare differences
-3. Incident links to earlier/later sessions → continue, trace connections
-4. Analyzed incidents cover all major problem types → stop
-5. 2 consecutive rounds with no new findings → stop
+优先级规则（首条命中即止）：
+1. 发现了未覆盖的新问题模式 → 继续，读取更多 incident
+2. 同一类问题跨多个项目出现 → 继续，对比差异
+3. 当前 incident 关联到更早/更晚的 session → 继续，追踪关联
+4. 已分析的 incident 覆盖了所有主要问题类型 → 停止
+5. 连续 2 轮没有新发现 → 停止
 
-After stopping, proceed to Stage 4.
+停止后进入阶段 4。
 
-### Stage 4: Synthesis & Output
+### 阶段 4：综合输出
 
-Based on all rounds of analysis, produce complete diagnosis:
+基于所有轮次的分析，产出完整诊断：
 
-1. **Dashboard Overview**: Health score, problem distribution charts, session distribution
-2. **Efficiency Data**: First-shot success rate, negation rate, Read:Edit ratio, cache efficiency, token usage
-3. **Incident Deep Analysis**: Context + root cause + extracted rules for each incident
-4. **Success Pattern Analysis**: Best Practices from successful sessions
-5. **Dimension Breakdown**: By project/task type (only when differences are significant)
-6. **Prompt Rules + Quick Install**: Rules copyable to any AI tool
-
----
-
-## Analysis Dimensions (9)
-
-| # | Dimension | Data Source | Output |
-|---|-----------|------------|--------|
-| 1 | Model Analysis | session JSONL (message.model) | Per-model complaint rate + problem characteristics + cross-version trends |
-| 2 | Frustration Signal Classification | history.jsonl prompt text | Problem distribution chart + incident list |
-| 3 | Positive Signal Extraction | history.jsonl + session JSONL | Success patterns + Best Practices |
-| 4 | Incident Deep Analysis | session JSONL (±4 turn context) | Root cause + traceable Prompt Rules |
-| 5 | Efficiency Data | session JSONL (usage field) | First-shot rate / negation rate / token ROI |
-| 6 | AI Behavior Quality | session JSONL (tool_use) | Read:Edit ratio / no-Read-before-Edit ratio |
-| 7 | Collaboration Profile | prompt text + session stats | Style classification / task type efficiency / peak hours |
-| 8 | Dimension Breakdown | Cross-tabulation | By project/task type/model (only when significant) |
-| 9 | High-Frequency Phrases | prompt text | Phrases user says repeatedly → workflow characteristics |
+1. **概览仪表盘**：健康度评分、问题分布图、session 分布
+2. **工具 & 模型分析**：按工具和模型双层展示问题率
+3. **Incident 深度分析**：上下文 + 根因 + 提炼规则（按根因模式分组）
+4. **成功模式分析**：从成功 session 中提炼 Best Practices
+5. **维度拆分**：按项目/任务类型拆分（仅差异显著时展示）
+6. **Prompt Rules**：给 AI 的规则，可复制安装
+7. **协作优化建议**：给用户的操作建议，解决规则管不到的问题
+8. **Quick Install**：规则安装到各工具的路径
 
 ---
 
-## Output Node Decision Rules
+## 分析维度
 
-| Node | Output When | Skip When |
-|------|------------|-----------|
-| Dashboard (health + distribution + sessions) | Always | Never |
-| Model Analysis | session JSONL has model data | Only single model |
-| Efficiency Table | session JSONL has usage data | Only history.jsonl, no usage |
-| Incident Analysis | ≥ 1 incident with context | No incidents |
-| Success Session Analysis | ≥ 1 success case with context | No success cases |
-| Collaboration Profile | ≥ 50 prompts | < 50 prompts |
-| Dimension Breakdown | Significant differences across dimensions | Not significant |
-| Prompt Rules | ≥ 1 generalizable rule | No rules |
-| Best Practices | ≥ 1 generalizable pattern | No patterns |
-| Quick Install | When Prompt Rules output exists | No rules |
+| # | 维度 | 数据来源 | 输出 | 状态 |
+|---|------|---------|------|------|
+| 1 | 工具 & 模型分析 | session JSONL（message.model） | 按工具 + 按模型双层分析 | ✅ |
+| 2 | 挫折信号分类 | prompt 文本 | 问题分布图 + incident 列表 | ✅ |
+| 3 | 正面信号提取 | prompt 文本 + session JSONL | 成功模式 + Best Practices | ✅ |
+| 4 | Incident 深度分析 | session JSONL（±4 轮上下文） | 根因 + 可溯源的 Prompt Rules | ✅ |
+| 5 | 维度拆分 | 交叉表 | 按项目/任务类型/模型拆分（仅差异显著时） | ✅ |
+| 6 | 高频短语 | prompt 文本 | 用户反复出现的短语 → 工作流特征 | ✅ |
+| 7 | 效率数据 | session 统计 + 否定关键词 | 一次成功率 / 否定率 / 效率分 | ✅ |
+| 8 | AI 行为质量 | session JSONL（tool_use） | Read:Edit 比 / 不读就写比率 | 🔜 规划中 |
+| 9 | 协作画像 | prompt 文本 | 任务类型分布 + 协作风格分布 | ✅ |
+| 10 | Prompt 质量评分 | prompt 文本 | 五维评分 + 分档分布 + 模糊率 | ✅ |
+| 11 | Session 反模式检测 | session 统计 | 否定循环 / 过短命令 / 膨胀 / 漂移 | ✅ |
 
 ---
 
-## Output Template
+## 输出节点决策规则
 
-Output directly in conversation. Match the user's language (Chinese or English).
+| 节点 | 输出条件 | 跳过条件 |
+|------|---------|---------|
+| 仪表盘（健康度 + 分布 + session） | 始终输出 | 不跳过 |
+| 工具 & 模型分析 | ≥ 2 个工具或 ≥ 2 个模型 | 只有单一工具 + 单一模型 |
+| Incident 分析 | ≥ 1 个有上下文的 incident | 无 incident |
+| 成功 session 分析 | ≥ 1 个有上下文的成功案例 | 无成功案例 |
+| 维度拆分 | 维度间差异显著 | 差异不显著 |
+| Prompt Rules | ≥ 1 条可泛化的规则 | 无规则 |
+| Best Practices | ≥ 1 个可泛化的模式 | 无模式 |
+| Prompt 质量 & 效率 | prompt_quality 字段非空 | 不跳过 |
+| Session 反模式 | session_antipatterns.total_detected > 0 | 无反模式 |
+| 协作优化建议 | 存在用户侧可改进的协作行为 | 所有问题都可通过 AI 规则解决 |
+| Quick Install | 有 Prompt Rules 输出时 | 无规则 |
 
-IMPORTANT: The analyzer outputs `category_labels` in JSON with both `en` and `zh` display names.
-Always use the human-readable label from `category_labels`, NEVER show raw keys like `low_effort` or `fabrication`.
+---
 
-ALWAYS use this structure:
+## 输出模板
+
+直接在对话中输出。匹配用户的语言（中文或英文）。
+
+重要：analyzer 输出的 `category_labels` JSON 包含 `en` 和 `zh` 两种显示名。
+始终使用 `category_labels` 中的可读标签，**禁止**显示原始 key 如 `low_effort` 或 `fabrication`。
+
+必须使用以下结构：
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════╗
@@ -193,29 +197,46 @@ ALWAYS use this structure:
 ║                                                                          ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
---- 1. Model Analysis ---
+--- 1. 工具 & 模型分析 ---
 
-Use box drawing. Show each model as a row with bar chart + stats.
-Bar charts use █ and ░ directly, no curly braces:
+<HARD-GATE>
+必须同时展示"按工具"和"按模型"两个子表。
+analyzer.py --mode=analyze 输出的 model_stats 字段包含每个模型的 prompt 数和问题率，
+不要跳过，必须渲染成表格。如果 model_stats 为空，显式说明"无模型数据"。
+</HARD-GATE>
+
+分两层展示：先按工具，再按模型。柱状图用 █ 和 ░：
 
 ┌───────────────────────────────────────────────────────────────────────────┐
-│  模型                总 prompt   问题数   问题率   主要问题                 │
-│  ──────────────────────────────────────────────────────────────────────── │
-│  claude-opus-4-6       605       32     5.3%   编造(12) 不认真(10)        │
-│  ████████████████████████████████████████████████░░░░░░░  605             │
+│  ──── 按工具 ──────────────────────────────────────────────────────────── │
+│  工具            总 prompt   问题数   问题率   主要问题                     │
+│  Claude Code       1200       120    10.0%   做错(40) 不认真(35)          │
+│  ████████████████████████████████████████████████████████  1200           │
+│  Codex               25         3    12.0%   不认真(1) 编造(1)            │
+│  █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  25            │
+│  ...                                                                      │
 │                                                                           │
-│  claude-opus-4-7       432        8     1.9%   不认真(4) 重复(3)          │
-│  ██████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░  432             │
+│  ──── 按模型 ──────────────────────────────────────────────────────────── │
+│  模型                     总 prompt   问题数   问题率   来源              │
+│  claude-opus-4-8             106        4     3.8%   Claude Code         │
+│  ██████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  106          │
+│  gpt-5.5                 27        1     3.7%   Codex               │
+│  ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  27           │
+│  claude-opus-4-7             400       36     9.0%   Claude Code         │
+│  █████████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░  400          │
+│  claude-opus-4-6             790       79    10.0%   Claude Code         │
+│  ████████████████████████████████████████████████████████░░  790          │
+│  ...                                                                      │
 │                                                                           │
 │  💡 发现                                                                   │
-│  · Which model has lowest issue rate and why                              │
-│  · Common issues across all versions                                      │
-│  · Version-specific patterns                                              │
+│  · 工具间差异 vs 模型间差异：哪个因素影响更大                              │
+│  · 新模型 vs 旧模型的问题率对比                                            │
+│  · 各模型/工具的共性问题和独有问题                                         │
 └───────────────────────────────────────────────────────────────────────────┘
 
---- 2. Problem Overview ---
+--- 2. 问题概览 ---
 
-Use box drawing. Three sub-sections. Bar charts use █ and ░ directly, no curly braces:
+用 box drawing 画表格。三个子区块。柱状图直接用 █ 和 ░：
 
 ┌───────────────────────────────────────────────────────────────────────────┐
 │  ──── 问题类型 ────────────────────────────────────────────────────────── │
@@ -230,177 +251,314 @@ Use box drawing. Three sub-sections. Bar charts use █ and ░ directly, no cur
 │   16-30 轮     ██████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   12    8%   │
 │   30+ 轮       ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    5    3%   │
 │                                                                           │
-│  ──── 按项目（归一化问题率，差异显著）──────────────────────────────────── │
+│  ──── 按项目（归一化问题率，差异显著时展示）──────────────────────────── │
 │   项目            总prompt  问题数  问题率  主要问题                       │
 │   projectA          80      12    15.0%  编造+不认真                      │
 │   projectB          60       6    10.0%  做错+编造                        │
 │   ...                                                                     │
 └───────────────────────────────────────────────────────────────────────────┘
 
---- 3. Incident Deep Analysis ---
+--- 3. Prompt 质量 & 效率 ---
 
-CRITICAL: Do NOT list incidents one by one. Instead:
-1. First analyze all incidents
-2. Group them by ROOT CAUSE PATTERN (e.g. "fabrication when info unavailable",
-   "overreach on modifications", "misunderstanding user intent")
-3. Name each pattern (Pattern A, B, C...) with a descriptive title
-4. Under each pattern, show 2-3 real cases with full conversation context
-
-Each pattern uses this box format:
+analyzer.py --mode=analyze 输出的 prompt_quality、efficiency、task_type_distribution、
+collab_style_distribution、session_antipatterns 字段包含以下数据，必须渲染。
 
 ┌───────────────────────────────────────────────────────────────────────────┐
-│  Covers {N} incidents · projects: {project1} / {project2}                │
+│  ──── Prompt 质量评分（五维模型，满分 100）───────────────────────────── │
 │                                                                           │
-│  Case 1  {project} · {task description}                                  │
-│  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄       │
-│  👤 {what user asked}                                                     │
-│  🤖 {what AI did wrong} → {specific wrong action}                        │
-│  👤 {user's correction — verbatim quote}                                  │
-│  → {what happened after}                                                  │
+│   平均分：{avg_score}/100                                                 │
 │                                                                           │
-│  Case 2  ...                                                              │
+│   优（80-100）  ████████████████████████████████████████████  {n}   {%}%  │
+│   良（60-79）   ██████████████████████░░░░░░░░░░░░░░░░░░░░░  {n}   {%}%  │
+│   中（40-59）   █████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  {n}   {%}%  │
+│   差（0-39）    ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  {n}   {%}%  │
 │                                                                           │
-│  Root cause: {one-sentence root cause}                                    │
-│  Context: {when this pattern typically occurs}                            │
+│   模糊率：{vagueness_rate}%（长度>10 但没有文件引用和目标动词）            │
+│                                                                           │
+│  ──── 效率三要素 ──────────────────────────────────────────────────────── │
+│                                                                           │
+│   一次成功率   {first_success_rate}%  ≤3 轮 + 无否定                      │
+│   否定率       {negation_rate}%      含否定关键词的 session 占比           │
+│   效率分       {efficiency_score}/100                                      │
+│                                                                           │
+│  ──── 任务类型分布 ────────────────────────────────────────────────────── │
+│   编码  ████████████████████████████████████████████  {n}                  │
+│   调试  ██████████████████░░░░░░░░░░░░░░░░░░░░░░░░░  {n}                  │
+│   调研  ██████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  {n}                  │
+│   写作  ██████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  {n}                  │
+│   配置  ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  {n}                  │
+│   其他  █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  {n}                  │
+│                                                                           │
+│  ──── 协作风格 ────────────────────────────────────────────────────────── │
+│   委托式（帮我/给我）   {n}  {%}%                                         │
+│   协作式（一起/讨论）   {n}  {%}%                                         │
+│   审查式（检查/review） {n}  {%}%                                         │
+│   指令式（直接指令）    {n}  {%}%                                         │
+│                                                                           │
+│  💡 发现                                                                   │
+│  · 根据数据得出的 2-3 条具体发现                                          │
 └───────────────────────────────────────────────────────────────────────────┘
 
---- 4. Success Session Analysis ---
+--- 4. Session 反模式 ---
 
-CRITICAL: Do NOT list sessions one by one. Instead:
-1. Analyze all successful sessions (≤5 turns, no negation)
-2. Group them into NAMED REUSABLE PATTERNS
-3. Each pattern shows a real example prompt and explains why it works
-
-Format:
+analyzer.py --mode=analyze 输出的 session_antipatterns 字段。
+仅在 total_detected > 0 时展示。
 
 ┌───────────────────────────────────────────────────────────────────────────┐
-│  ✅ Pattern A  {pattern name} (~{N}% of successful sessions)             │
-│  ─────────────────────────────────────────────────────────────────────    │
-│  "{example first prompt from a real session}"                             │
-│  → {why this works: specific elements that made it succeed}              │
+│  ──── 检测到的用户侧反模式 ────────────────────────────────────────────  │
 │                                                                           │
-│  ✅ Pattern B  ...                                                        │
+│   否定循环（连续 ≥2 轮否定）     {n} 个 session                           │
+│   过短命令（≥3 条 <10 字符）     {n} 个 session                           │
+│   Session 膨胀（>50 轮）         {n} 个 session                           │
+│   目标漂移（任务类型切换 ≥3）    {n} 个 session                           │
+│                                                                           │
+│  ──── 受影响的 session ────────────────────────────────────────────────── │
+│   项目        反模式类型       轮次   建议                                │
+│   projectA    否定循环          12    第 2 次否定时停下来重写 prompt       │
+│   projectB    Session 膨胀      65    拆成多个 session，一个目标一个        │
+│   ...                                                                     │
+│                                                                           │
+│  参考：references/反模式库.md 的 1-4 章（用户侧）详细说明                 │
+└───────────────────────────────────────────────────────────────────────────┘
+
+--- 5. Incident 深度分析 ---
+
+关键要求：不要逐个列举 incident。而是：
+1. 先分析所有 incident
+2. 按根因模式分组（如"信息不足时编造"、"越权修改"、"误解用户意图"）
+3. 每个模式命名（模式 A、B、C...）并附描述性标题
+4. 每个模式下展示 2-3 个真实案例，包含完整对话上下文
+
+每个模式的格式：
+
+┌───────────────────────────────────────────────────────────────────────────┐
+│  涉及 N 个 incident · 覆盖 project1 / project2                           │
+│                                                                           │
+│  案例 1  project · 任务描述                                               │
+│  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄       │
+│  👤 用户说了什么                                                           │
+│  🤖 AI 做了什么 → 具体的错误行为                                          │
+│  👤 用户的纠正（原话引用）                                                │
+│  → 后续发展                                                               │
+│                                                                           │
+│  案例 2  ...                                                              │
+│                                                                           │
+│  根因  一句话根因描述                                                      │
+│  场景  什么时候容易出现                                                    │
+└───────────────────────────────────────────────────────────────────────────┘
+
+--- 6. 成功 session 分析 ---
+
+关键要求：不要逐个列举 session。而是：
+1. 分析所有成功 session（≤5 轮，无否定词）
+2. 按可复用模式分组并命名
+3. 每个模式展示一个真实的首条 prompt 示例，说明为什么有效
+
+格式：
+
+┌───────────────────────────────────────────────────────────────────────────┐
+│  ✅ 模式 A  模式名（约占成功 session 的 N%）                              │
+│  ─────────────────────────────────────────────────────────────────────    │
+│  "真实 session 的首条 prompt"                                              │
+│  → 为什么有效：哪些要素让它一次成功                                        │
+│                                                                           │
+│  ✅ 模式 B  ...                                                           │
 │  ...                                                                     │
 └───────────────────────────────────────────────────────────────────────────┘
 
---- 5. Prompt Rules ---
+--- 7. Prompt Rules ---
 
-Two-tier output in box format:
+分两层输出：
+- **通用规则**：从根因模式中抽象出的行为规则，具体到可直接执行，每条带溯源
+- **定制发现**：仅对当前用户有价值的模式，标注"可选保留"
+
+规则质量标准（按此水平输出，不能更低）：
+  ❌ 太基础："不确定的内容必须标注不确定" — 空话
+  ❌ 太定制："X 项目的 AB 实验要先读 wiki 文档" — 只对一个人有用
+  ✅ 正确水平：概括到一类行为 + 给出具体的执行标准 + 说清禁止什么
+
+**关键：规则必须以纯文本格式输出，用户可以直接复制到 CLAUDE.md / AGENTS.md / .cursorrules。**
+不要用 box-drawing 字符（┌─┐│└─┘）包裹规则，不要加边框。溯源信息单独放在规则列表之后。
+
+输出格式：
+
+```
+## 通用规则（直接复制到你的 AI 工具配置文件）
+
+1. 规则内容第一条，具体到可执行。
+2. 规则内容第二条。
+...
+
+> 溯源：规则 1 来自模式 A（N 个 incident），规则 2 来自模式 B（N 个 incident）...
+
+## 定制发现（可选保留）
+
+a. 发现内容
+b. ...
+```
+
+--- 8. 协作优化建议 ---
+
+有些问题光给 AI 加规则解决不了，需要用户调整协作方式或安装工具。
+这部分面向用户，告诉他"你可以做什么让问题不再出现"。
+
+产出要求：
+- 每条建议必须溯源到具体的 incident 模式
+- 不只是"写好 prompt"这种文字建议——要覆盖以下 6 类手段，按场景选用：
+
+| 手段 | 适用场景 | 示例 |
+|------|---------|------|
+| Rules 文件 | AI 的持久行为约束 | 在 CLAUDE.md 里加"写代码前必须先 Read" |
+| Hooks | 自动化的强制检查/拦截 | 安装 hook 拦截 git push（不跑测试不让推） |
+| Skills | 重复性工作流封装 | 创建一个"线上排查"skill，固化排查流程 |
+| MCP 工具 | 连接外部系统 | 配置 Context7 MCP 自动拉取框架文档 |
+| 模型/工具选择 | 选对模型做对事 | 复杂推理用 opus-4-8，简单任务用 sonnet |
+| 上下文工程 | 给 AI 正确的输入 | 给链接时粘贴关键片段，别只丢一个 URL |
+
+格式（根据实际分析结果，选择适用的手段）：
 
 ┌───────────────────────────────────────────────────────────────────────────┐
-│  Universal Rules — applicable to any user, any AI tool                   │
+│  协作优化建议 — 你可以做的                                                 │
 │                                                                           │
-│  1. {rule text}                                                           │
-│     ── Source: Pattern {X}, {N} incidents, {description}                  │
+│  🔧 安装/创建类                                                            │
+│  1. [Hook] 关键操作前自动拦截                                              │
+│     创建 hook 在 git push 前强制跑测试 / 在 Edit 前检查是否先 Read 了       │
+│     → hookify 一键创建，命令：/hookify                                     │
+│     ── 溯源：模式 A（不读就写），N 个 incident                              │
 │                                                                           │
-│  2. ...                                                                   │
+│  2. [Skill] 把高频工作流封装成 Skill                                       │
+│     线上排查、系分文档、CR 等重复流程封装后一次成功率翻倍                   │
+│     → skill-creator 创建，命令：/skill-creator                             │
+│     ── 溯源：成功模式 A（Skill 直接执行 vs 自由对话）                      │
+│                                                                           │
+│  📋 习惯调整类                                                             │
+│  3. [上下文] 给链接时粘贴关键 3-5 行                                       │
+│     AI 读不到内网链接就会编造。粘贴 API 签名 / 核心逻辑 / 配置项           │
+│     比等它编错再纠正快 10 倍                                               │
+│     ── 溯源：模式 A + B，N 个 incident                                    │
+│                                                                           │
+│  4. [模型] 复杂任务切到更强模型                                            │
+│     数据显示 opus-4-8 问题率 3.8% vs opus-4-6 的 10%                       │
+│     排查、架构设计等高推理任务值得用更好的模型                              │
+│     ── 溯源：模型分析数据                                                  │
+│                                                                           │
+│  （以上为示例格式和手段类型，实际建议根据分析结果产出）                     │
 └───────────────────────────────────────────────────────────────────────────┘
+
+--- 9. Quick Install ---
+
+<HARD-GATE>
+必须用 AskUserQuestion 工具让用户选择安装方式。不要只展示表格就结束。
+</HARD-GATE>
+
+先展示配置路径表格，然后**用 AskUserQuestion 询问用户想怎么安装**：
 
 ┌───────────────────────────────────────────────────────────────────────────┐
-│  Custom Findings — valuable for this user only, optional to keep         │
-│                                                                           │
-│  a. {finding}                                                             │
-│  b. ...                                                                   │
+│  工具          项目级配置文件                  全局级配置文件                │
+│  Claude Code   项目根目录 CLAUDE.md           ~/.claude/CLAUDE.md          │
+│  Codex         项目根目录 AGENTS.md           ~/.codex/AGENTS.md           │
+│  Cursor        .cursor/rules/*.mdc            Settings → Rules for AI      │
+│  Cline         .clinerules/ 目录              ~/Documents/Cline/Rules/     │
+│  Windsurf      .windsurf/rules/*.md           Settings → AI Rules          │
+│  其他工具      —                              System Prompt / Instructions │
 └───────────────────────────────────────────────────────────────────────────┘
 
-Rules MUST be generalized from specific incidents to universal patterns:
-  ❌ "Project X's AB experiment needs to read the wiki docs first" — too specific
-  ✅ "When user provides documentation, must read it first; if unreadable, say so" — universal
-Each rule annotated with source pattern and incident count (higher density = more credible).
+用 AskUserQuestion 工具提供安装选项（multiSelect: true，允许多选）：
+- "写入所有检测到的工具"：自动写入用户机器上存在的所有 AI 工具配置
+- "只写入 Claude Code (CLAUDE.md)"
+- "只写入 Codex (AGENTS.md)"
+- "只写入 Cursor (.cursorrules)"
+- "只复制文本，我自己粘贴"
 
---- 6. Quick Install ---
+写入规则：
+- 用 Write/Edit 工具追加到对应文件，不覆盖已有内容
+- 追加时加段落标题 `## AI 协作规则（auto-generated by ai-interaction-analyzer）`
+- 如果文件已有该段落标题，替换该段落内容（不重复追加）
+- 每个工具写入后报告完整路径
 
-┌───────────────────────────────────────────────────────────────────────────┐
-│  Copy rules to your AI tool's config file:                               │
-│                                                                           │
-│   Claude Code → CLAUDE.md            Cursor    → .cursorrules            │
-│   Codex      → AGENTS.md             Cline     → .clinerules             │
-│   Windsurf   → .windsurfrules        General   → System Prompt           │
-└───────────────────────────────────────────────────────────────────────────┘
+然后输出三个可复制的段落：
 
-Then output THREE copyable sections:
+## 通用规则（直接复制）
+编号列表，纯文本，不带 box
 
-## Universal Rules (copy directly)
-{numbered list of all universal rules, plain text, no box drawing}
+## Best Practices（高效协作模式）
+字母列表，每条一行：模式名 + 关键要素
 
-## Best Practices (copy directly)
-{lettered list of success patterns, one line each: pattern name + key elements}
-
-## Custom Findings (optional)
-{lettered list of custom findings}
+## 定制规则（可选保留）
+字母列表
 ```
 
 ---
 
-## Fixed Output Rules
+## 固定输出规则
 
-### Content Rules
-1. **Report outputs directly in conversation**. Save to file only when user requests.
-2. **Incident analysis must be based on real context**. Never generalize rules without reading context — better to output less than to fabricate.
-3. **Every rule must trace to specific incidents**. No untraceable generic advice like "improve prompt quality".
-4. **Include both positive and negative analysis**. Only looking at problems is one-sided.
-5. **Context-aware**: `git commit`, `continue`, `ok` are perfectly normal in conversation, not problems.
-6. **Dimension breakdown only when differences are significant**. Don't default to per-project tables.
-7. **Quick Install is tool-agnostic**. List all major AI tool config paths, user chooses.
-8. **Rules must be generalized**. Abstract from specific incidents to pattern-level. Custom findings listed separately.
-9. **Don't be lazy**. Layer 2 must cover all high-density sessions (signal ≥ 3), not just 2-3 then stop.
+### 内容规则
+1. **报告直接在对话中输出**。只有用户要求时才保存到文件。
+2. **Incident 分析必须基于真实上下文**。没读上下文就不要泛化规则 — 宁可少输出也不要编造。
+3. **每条规则必须溯源到具体 incident**。禁止不可追溯的泛泛建议如"提升 prompt 质量"。
+4. **正负面都要分析**。只看问题不看亮点是片面的。
+5. **语境感知**：`git commit`、`continue`、`ok` 在对话中完全正常，不是问题。
+6. **维度拆分仅在差异显著时展示**。不要默认输出按项目的表格。
+7. **Quick Install 不绑定工具**。列出所有主流 AI 工具的配置路径，让用户选。
+8. **规则必须泛化**。从具体 incident 抽象到模式层面。定制发现单独列出。
+9. **不要偷懒**。Layer 2 必须覆盖所有高密度 session（信号 ≥ 3），不能只看 2-3 个就停。
 
-### Visual Rules
-1. **Every major section needs numbered headings** (1, 2, 3...) for quick scanning.
-2. **Use charts not prose**: problem distribution → bar chart, session distribution → bar chart, model comparison → table + chart.
-3. **Incidents use bordered structure**: prior context / complaint / correction / root cause — four sections clearly separated.
-4. **Success sessions use card style**: one card per pattern with first prompt + why successful + extracted pattern.
-5. **Separate universal and custom rules**: universal rules get copyable text, custom findings marked "personal, optional to keep".
+### 视觉规则
+1. **每个大段必须编号**（1、2、3...），方便快速扫描。
+2. **用图表不用大段文字**：问题分布 → 柱状图，session 分布 → 柱状图，模型对比 → 表格 + 图。
+3. **Incident 用边框结构**：前因 / 投诉 / 纠正 / 根因 四部分分明。
+4. **成功 session 用卡片风格**：每个模式一张卡片，包含首条 prompt + 为什么成功 + 提炼的模式。
+5. **通用规则和定制发现分开**：通用规则给可复制的纯文本，定制发现标注"个人适用，可选保留"。
 
 ---
 
-## Constraints & Anti-Patterns
+## 约束与反模式
 
 <HARD-GATE>
-- Pure local analysis, no data upload, no external API calls
-- Read-only on user data files, never modify AI tool config or logs
-- No value judgments on the user, only point out specific improvable items
-- Each incident context limited to ±4 turns, never read entire sessions
+- 纯本地分析，不上传数据，不调用外部 API
+- 只读用户数据文件，禁止修改 AI 工具的配置或日志
+- 不对用户做价值判断，只指出具体可改进的点
+- 每个 incident 上下文限制 ±4 轮，禁止读取整个 session
 </HARD-GATE>
 
-### Anti-Pattern 1: Generalizing rules without reading context
-❌ Seeing prompt "deployed but still broken" → generalizing "switch paths when stuck"
-✅ Reading context reveals AI didn't read docs before writing code → generalize "must read docs before writing code"
+### 反模式 1：不读上下文就泛化规则
+❌ 看到 prompt "部署了还是有问题" → 泛化出"遇到困难要换思路"
+✅ 读取上下文发现 AI 没读文档就写代码 → 泛化出"写代码前必须先读文档"
 
-### Anti-Pattern 2: Outputting stats reports
-❌ "Vagueness rate 58%, negation rate 30%, first-shot rate 50%"
-✅ Specific incident analysis + traceable rules
+### 反模式 2：输出统计报告
+❌ "模糊率 58%，否定率 30%，一次成功率 50%"
+✅ 具体 incident 分析 + 可溯源的规则
 
-### Anti-Pattern 3: Rules too vague
-❌ "Suggest improving prompt specificity"
-✅ "When introducing concepts, give entity identity first (what/who made it/open source?), then use analogies"
+### 反模式 3：规则太模糊
+❌ "建议提升 prompt 的具体性"
+✅ "介绍概念时先给实体身份（是什么/谁做的/开不开源），再用类比"
 
-### Anti-Pattern 4: Only looking at negatives
-❌ All problems no highlights
-✅ Also show successful session patterns, tell user what practices to keep
+### 反模式 4：只看负面
+❌ 全是问题没有亮点
+✅ 同时展示成功 session 的模式，告诉用户哪些做法要保持
 
-### Anti-Pattern 5: Tool-specific binding
-❌ Quick Install only writes CLAUDE.md
-✅ List Claude Code / Cursor / Codex / Cline / Windsurf and all tool config paths
+### 反模式 5：绑定特定工具
+❌ Quick Install 只写 CLAUDE.md
+✅ 列出 Claude Code / Cursor / Codex / Cline / Windsurf 等所有工具的配置路径
 
-### Anti-Pattern 6: Rules too specific, not universal
-❌ "Project X's AB experiment needs to read the wiki docs first"
-✅ "When user provides doc links, must read docs first; if unreadable, say so"
-Custom findings (project-specific patterns) go in the "Custom Findings" section
+### 反模式 6：规则太定制，不通用
+❌ "X 项目的 AB 实验要先读 wiki 文档"
+✅ "用户给了文档链接必须先读，读不到要明确告知"
+定制发现（项目特有的模式）放在"定制发现"段落
 
-### Anti-Pattern 7: Lazy analysis only looking at a few incidents
-❌ 51 problem sessions but only deep-analyzed 3 before outputting report
-✅ Cover all sessions with signal ≥ 3, loop until no new patterns
+### 反模式 7：偷懒只分析几个 incident
+❌ 51 个问题 session 只深入分析了 3 个就出报告
+✅ 覆盖所有信号 ≥ 3 的 session，循环到没有新模式为止
 
-### Anti-Pattern 8: Editing one thing but losing others
-❌ Receiving feedback then heavily rewriting, deleting previously polished efficiency data/charts/profile
-✅ Incremental improvement: add new content, keep existing good content, precisely update conflicts
+### 反模式 8：改一个丢三个
+❌ 收到反馈后大幅重写，把之前调好的效率数据/图表/画像都删了
+✅ 增量改进：加新内容、保留已有好内容、精确更新冲突点
 
 ---
 
-## Installation
+## 安装
 
 ```bash
-# One-command install (checks environment, creates symlink, scans data sources)
+# 一键安装（检查环境、创建软链、扫描数据源）
 bash <SKILL_DIR>/scripts/setup.sh
 ```

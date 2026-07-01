@@ -26,9 +26,31 @@ from statistics import mean
 
 CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
+QODER_DIR = Path.home() / ".qoder"
 SKILL_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = SKILL_DIR / "config"
 USER_CONFIG_DIR = Path.home() / ".config" / "ai-interaction-analyzer"
+
+
+def _app_data_dirs(app_name):
+    """Return platform-specific application data directories for a given app.
+    Returns a list of candidate paths (first existing one wins at call sites).
+    """
+    home = Path.home()
+    if sys.platform == "darwin":
+        return [home / "Library/Application Support" / app_name]
+    elif sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", str(home / "AppData/Roaming"))
+        localappdata = os.environ.get("LOCALAPPDATA", str(home / "AppData/Local"))
+        return [Path(appdata) / app_name, Path(localappdata) / app_name]
+    else:  # Linux / other
+        xdg = os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))
+        return [Path(xdg) / app_name]
+
+
+CURSOR_DATA_DIRS = _app_data_dirs("Cursor")
+VSCODE_DATA_DIRS = _app_data_dirs("Code")
+QODER_APP_DIRS = _app_data_dirs("Qoder")
 
 # ─── Custom config ────────────────────────────────────────────
 
@@ -142,37 +164,94 @@ def text_from_blocks(content):
 FRUSTRATION_CATEGORIES = {
     "fabrication": {
         "label": {"en": "AI fabrication", "zh": "AI 编造瞎猜"},
-        "pattern": re.compile(r"胡编乱造|瞎编|编的吧|瞎猜|别猜|不要猜|瞎说|乱说|胡说|你在编|你编的|捏造|杜撰|fabricat|hallucin|making.?up|made.?up|invented"),
-        "meaning": "AI output false information or speculative content",
+        "pattern": re.compile(
+            # direct
+            r"胡编乱造|瞎编|编的吧|瞎猜|别猜|不要猜|瞎说|乱说|胡说|你在编|你编的|捏造|杜撰"
+            r"|fabricat|hallucin|making.?up|made.?up|invented"
+            # polite
+            r"|有依据吗|哪来的结论|你验证了吗|你确认过吗|这是你猜的"
+            r"|where did you get|did you verify|is this accurate|based on what"
+            r"|source.?for this|evidence|did you actually check"
+        ),
+        "meaning": "AI output false or unverified information",
     },
     "incorrect": {
         "label": {"en": "Incorrect output", "zh": "AI 做错了"},
-        "pattern": re.compile(r"不对|错了|搞错|弄错|改错|写错|放错|用错|选错|wrong|incorrect|that'?s not|not right"),
+        "pattern": re.compile(
+            # direct
+            r"不对|错了|搞错|弄错|改错|写错|放错|用错|选错"
+            r"|wrong|incorrect|that'?s not|not right"
+            # polite
+            r"|好像不太对|跟我预期的不[太一]样|这个结果有[点些]问题|不太对劲|跟我想的不一样"
+            r"|not quite|not exactly|doesn'?t look right|doesn'?t seem right"
+            r"|not what I expected|not what I meant|not what I had in mind"
+            r"|I was expecting|that'?s off|a bit off"
+        ),
         "meaning": "AI output did not match user expectation",
     },
     "low_effort": {
         "label": {"en": "Shallow thinking", "zh": "AI 不够认真"},
-        "pattern": re.compile(r"仔细[想看看看]|深度思考|认真[一点些]|用心|好好[想看]|动动脑|think.?hard|think.?deep|carefully|pay attention|more thought"),
+        "pattern": re.compile(
+            # direct
+            r"仔细[想看看看]|深度思考|认真[一点些]|用心|好好[想看]|动动脑"
+            r"|think.?hard|think.?deep|carefully|pay attention|more thought"
+            # polite
+            r"|能不能再想想|再[认仔]真[看想]看|你有没有仔细|草率了|太敷衍|太笼统|太粗糙|太表面"
+            r"|could you reconsider|think about it more|look more carefully|a bit superficial"
+            r"|too generic|too vague|too shallow|put more thought|not thorough"
+            r"|didn'?t really think|half.?baked"
+        ),
         "meaning": "User feels AI was lazy or lacked depth",
     },
     "repeated_mistake": {
         "label": {"en": "Repeated mistakes", "zh": "AI 重复犯错"},
-        "pattern": re.compile(r"又[来是错]|还是[这那]样|老是|不要老|反复|一直在|again|keep|still|same mistake|same error"),
+        "pattern": re.compile(
+            # direct
+            r"又[来是错]|还是[这那]样|老是|不要老|反复|一直在"
+            r"|again|keep|still|same mistake|same error"
+            # polite
+            r"|上次也[是这]样|之前就说过|说了好几遍了|还是没改|怎么又"
+            r"|we.?ve been over this|already told you|mentioned this before|same issue"
+            r"|didn'?t we fix this|thought we resolved|happening again"
+        ),
         "meaning": "AI keeps making the same mistake",
     },
     "overreach": {
         "label": {"en": "Overreach", "zh": "越权操作"},
-        "pattern": re.compile(r"谁让你|我[没没有]说|我[没没有]让|我要的是|我说的是|不是让你|别[瞎乱]改|不要[随瞎乱]便|didn'?t ask|not what I|don't change|never asked"),
+        "pattern": re.compile(
+            # direct
+            r"谁让你|我[没没有]说|我[没没有]让|我要的是|我说的是|不是让你|别[瞎乱]改|不要[随瞎乱]便"
+            r"|didn'?t ask|not what I|don'?t change|never asked"
+            # polite
+            r"|超出范围了|我没要求这个|为什么要改这[个里]|多此一举|画蛇添足"
+            r"|beyond.?scope|out of scope|I only asked for|why did you change"
+            r"|I didn'?t mean for you to|went too far|more than I asked"
+        ),
         "meaning": "AI exceeded instructions or misunderstood intent",
     },
     "undo_redo": {
         "label": {"en": "Undo / redo", "zh": "撤销重来"},
-        "pattern": re.compile(r"撤[销回]|回滚|重[来做写]|还原|恢复|全[部都]删|undo|revert|rollback|start over|redo|go back"),
+        "pattern": re.compile(
+            # direct
+            r"撤[销回]|回滚|重[来做写]|还原|恢复|全[部都]删|undo|revert|rollback|start over|redo|go back"
+            # polite
+            r"|换[个种]思路|换[个种]方[向式法]|要不重新来|从头开始|算了不要了"
+            r"|different approach|try another way|start fresh|scrap this|let'?s try something else"
+            r"|back to square one|discard|throw this away"
+        ),
         "meaning": "AI output needs to be completely discarded",
     },
     "distrust": {
         "label": {"en": "Distrust", "zh": "质疑/不信任"},
-        "pattern": re.compile(r"你确[定认]|真的吗|靠谱吗|能[行用]吗|有[没]有问题|are you sure|really\?|is that right|does that work"),
+        "pattern": re.compile(
+            # direct
+            r"你确[定认]|真的吗|靠谱吗|能[行用]吗|有[没]有问题"
+            r"|are you sure|really\?|is that right|does that work"
+            # polite
+            r"|你看过[代代码]了吗|你读了吗|我[有点]怀疑|不太放心|感觉不太靠谱"
+            r"|did you actually read|did you check|I'?m not (so )?sure|doesn'?t feel right"
+            r"|I have doubts|not confident|can you double.?check|seems questionable"
+        ),
         "meaning": "User doubts AI output accuracy",
     },
 }
@@ -325,13 +404,47 @@ def extract_json_user_messages(obj, inherited_session="", source_hint=""):
 def load_cursor_prompts(days=None, project=None):
     """Best-effort Cursor SQLite reader. Schema varies across versions."""
     cutoff = cutoff_ms(days)
-    roots = [
-        Path.home() / "Library/Application Support/Cursor/User/globalStorage/state.vscdb",
-        *glob.glob(str(Path.home() / "Library/Application Support/Cursor/User/workspaceStorage/*/state.vscdb")),
-    ]
+    roots = []
+    for d in CURSOR_DATA_DIRS:
+        roots.append(d / "User/globalStorage/state.vscdb")
+        roots.extend(glob.glob(str(d / "User/workspaceStorage/*/state.vscdb")))
     records = []
     for db in roots:
         db = Path(db)
+        workspace = db.parent.name if db.parent.name != "globalStorage" else "global"
+
+        # Cursor stores prompts in aiService.prompts / aiService.generations
+        gen_index = {}
+        gen_rows = sqlite_fetch(db, "select value from ItemTable where key='aiService.generations'")
+        for (val,) in gen_rows:
+            try:
+                for g in json.loads(val):
+                    desc = (g.get("textDescription") or "").strip()
+                    if desc:
+                        gen_index[desc[:80]] = coerce_ts_ms(g.get("unixMs"))
+            except (TypeError, json.JSONDecodeError):
+                pass
+
+        prompt_rows = sqlite_fetch(db, "select value from ItemTable where key='aiService.prompts'")
+        for (val,) in prompt_rows:
+            try:
+                for p in json.loads(val):
+                    text = (p.get("text") or "").strip()
+                    if not text or len(text) < 3:
+                        continue
+                    ts = gen_index.get(text[:80], 0)
+                    if cutoff and ts and ts < cutoff:
+                        continue
+                    if project and project not in workspace:
+                        continue
+                    records.append(make_prompt_record(
+                        "cursor", "Cursor", text, ts, workspace, "",
+                        metadata={"db": str(db), "key": "aiService.prompts"},
+                    ))
+            except (TypeError, json.JSONDecodeError):
+                pass
+
+        # Also check legacy chat/composer keys
         rows = sqlite_fetch(
             db,
             "select key, value from ItemTable where lower(key) like '%chat%' "
@@ -345,7 +458,6 @@ def load_cursor_prompts(days=None, project=None):
             for sid, text, ts in extract_json_user_messages(obj, inherited_session=str(key), source_hint="cursor"):
                 if cutoff and ts and ts < cutoff:
                     continue
-                workspace = db.parent.name if db.parent.name != "globalStorage" else "global"
                 if project and project not in workspace and project not in str(db):
                     continue
                 records.append(make_prompt_record(
@@ -386,11 +498,11 @@ def load_json_file_prompts(source_id, source_name, paths, days=None, project=Non
 
 
 def load_cline_roo_prompts(days=None, project=None):
-    roots = [
-        Path.home() / "Library/Application Support/Code/User/globalStorage",
-        Path.home() / "Library/Application Support/Cursor/User/globalStorage",
-        Path.home() / ".vscode/extensions",
-    ]
+    roots = [Path.home() / ".vscode/extensions"]
+    for d in VSCODE_DATA_DIRS:
+        roots.append(d / "User/globalStorage")
+    for d in CURSOR_DATA_DIRS:
+        roots.append(d / "User/globalStorage")
     files = []
     for root in roots:
         if root.exists():
@@ -418,6 +530,107 @@ def load_chatgpt_export_prompts(days=None, project=None):
     return load_json_file_prompts("chatgpt-export", "ChatGPT Export", candidates[:50], days, project)
 
 
+
+def load_qoder_prompts(days=None, project=None):
+    """Load Qoder IDE conversation prompts from JSONL transcript files.
+
+    Qoder stores full plaintext transcripts at:
+      ~/.qoder/projects/<project-path>/transcript/<session-id>.jsonl
+      ~/.qoder/cache/projects/<project-hash>/conversation-history/<id>/<id>.jsonl
+    """
+    records = []
+    cutoff = cutoff_ms(days)
+    transcript_dirs = []
+
+    # Collect all transcript directories
+    if QODER_DIR.exists():
+        for d in [QODER_DIR / "projects", QODER_DIR / "cache" / "projects"]:
+            if d.exists():
+                transcript_dirs.append(d)
+
+    jsonl_files = []
+    for base in transcript_dirs:
+        jsonl_files.extend(base.rglob("*.jsonl"))
+
+    for jsonl_path in jsonl_files:
+        session_id = jsonl_path.stem
+        # Derive project name from path
+        parts = str(jsonl_path.relative_to(QODER_DIR)).split("/")
+        project_name = "unknown"
+        if len(parts) >= 2:
+            raw = parts[1]
+            # Try to extract meaningful project name from path
+            segments = raw.rsplit("-", 1)
+            if len(segments) == 2 and len(segments[1]) == 8 and all(c in '0123456789abcdef' for c in segments[1]):
+                # cache format: "projname-hash8"
+                project_name = segments[0]
+            else:
+                # projects format: "-Users-user-path-to-project" → take last meaningful segment
+                name_parts = [p for p in raw.strip("-").split("-") if p]
+                # Skip common path prefixes
+                skip = {"Users", "home", "Project", "Projects", "workspace"}
+                meaningful = [p for p in name_parts if p not in skip and len(p) > 1]
+                project_name = meaningful[-1] if meaningful else name_parts[-1] if name_parts else raw
+
+        if project and project not in project_name:
+            continue
+
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    obj_type = obj.get("type", "")
+                    obj_role = obj.get("role", "")
+                    if obj_type not in ("user",) and obj_role not in ("user", "human"):
+                        continue
+
+                    msg = obj.get("message", {}) if obj_type == "user" else obj
+                    if not isinstance(msg, dict):
+                        continue
+
+                    content = msg.get("content", "")
+                    text = ""
+                    if isinstance(content, str):
+                        text = content.strip()
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text = (block.get("content", "") or block.get("text", "")).strip()
+                                break
+                        # If only tool_result blocks, skip
+                        if not text:
+                            continue
+
+                    if not text or len(text) < 3:
+                        continue
+                    # Skip system/tool outputs
+                    if text.startswith("Command completed") or text.startswith("Contents of /"):
+                        continue
+
+                    ts_str = obj.get("timestamp", "")
+                    ts_ms = coerce_ts_ms(ts_str)
+                    if cutoff and ts_ms and ts_ms < cutoff:
+                        continue
+
+                    records.append(make_prompt_record(
+                        "qoder", "Qoder", text, ts_ms,
+                        project_name, session_id,
+                        transcript_path=str(jsonl_path),
+                        metadata={"mode": "agent"},
+                    ))
+        except OSError:
+            continue
+
+    return records
+
+
 def load_prompts(days=None, project=None, sources=None):
     """Load prompt index from all supported providers."""
     selected = parse_sources(sources) if isinstance(sources, str) else sources
@@ -428,6 +641,7 @@ def load_prompts(days=None, project=None, sources=None):
         ("cline-roo", load_cline_roo_prompts),
         ("gemini", load_gemini_prompts),
         ("chatgpt-export", load_chatgpt_export_prompts),
+        ("qoder", load_qoder_prompts),
     ]
     records = []
     for source_id, loader in loaders:
@@ -674,6 +888,122 @@ def compute_session_stats(prompts):
     }
 
 
+def _extract_model_claude(sid, metadata):
+    """Extract model from Claude Code session JSONL."""
+    tp = metadata.get("project_path", "")
+    if not tp:
+        return None
+    sid_short = sid[:8]
+    projects_dir = CLAUDE_DIR / "projects"
+    if not projects_dir.exists():
+        return None
+    for jsonl_file in projects_dir.rglob("*.jsonl"):
+        if sid_short in jsonl_file.name and "audit" not in str(jsonl_file):
+            try:
+                with open(jsonl_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            obj = json.loads(line)
+                            if obj.get("type") == "assistant":
+                                model = obj.get("message", {}).get("model", "")
+                                if model:
+                                    return model
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+            except OSError:
+                pass
+            break
+    return None
+
+
+def _extract_model_codex(sid, metadata):
+    """Extract model from Codex rollout JSONL (turn_context.payload.model)."""
+    thread_index = load_codex_thread_index()
+    path = find_codex_rollout(sid, thread_index)
+    if not path:
+        return None
+    try:
+        for obj in iter_jsonl(path):
+            if obj.get("type") == "turn_context":
+                model = obj.get("payload", {}).get("model")
+                if model:
+                    return model
+    except OSError:
+        pass
+    return None
+
+
+def _extract_model_qoder(sid, metadata):
+    """Extract model from Qoder JSONL (assistant record obj.model or obj.message.model)."""
+    for base in [QODER_DIR / "projects", QODER_DIR / "cache" / "projects"]:
+        if not base.exists():
+            continue
+        for jsonl in base.rglob("*.jsonl"):
+            if sid[:12] not in jsonl.stem:
+                continue
+            try:
+                for obj in iter_jsonl(jsonl):
+                    if obj.get("role") == "assistant" or obj.get("type") == "assistant":
+                        model = obj.get("model") or obj.get("message", {}).get("model", "")
+                        if model and model != "auto":
+                            return model
+                        if model == "auto":
+                            provider = obj.get("provider", "")
+                            return f"qoder:{provider}" if provider else "qoder:auto"
+            except OSError:
+                pass
+            return None
+    return None
+
+
+_MODEL_EXTRACTORS = {
+    "claude-code": _extract_model_claude,
+    "codex": _extract_model_codex,
+    "qoder": _extract_model_qoder,
+}
+
+
+def compute_model_stats(prompts, signals):
+    """Extract per-model prompt counts and frustration stats from session JSONL."""
+    model_prompts = Counter()
+    session_models = {}
+
+    for p in prompts:
+        sid = p.get("session_id", "")
+        source_id = p.get("source_id", "")
+        if not sid or source_id not in _MODEL_EXTRACTORS:
+            continue
+        if sid in session_models:
+            model_prompts[session_models[sid]] += 1
+            continue
+        model = _MODEL_EXTRACTORS[source_id](sid, p.get("metadata", {}))
+        if model:
+            session_models[sid] = model
+            model_prompts[model] += 1
+        if sid in session_models:
+            model_prompts[session_models[sid]] += 1
+
+    if not model_prompts:
+        return {}
+
+    model_frustration = Counter()
+    for s in signals:
+        sid = s.get("session_id", "")
+        model = session_models.get(sid)
+        if model:
+            model_frustration[model] += 1
+
+    result = {}
+    for model, count in model_prompts.most_common(10):
+        frust = model_frustration.get(model, 0)
+        result[model] = {
+            "total_prompts": count,
+            "frustration_count": frust,
+            "frustration_rate": round(frust / max(count, 1) * 100, 1),
+        }
+    return result
+
+
 def compute_high_frequency_phrases(prompts, top_n=10):
     """Find high-frequency phrases the user repeats (CJK + English)."""
     phrase_counter = Counter()
@@ -697,6 +1027,271 @@ def compute_high_frequency_phrases(prompts, top_n=10):
     filtered = [(ph, c) for ph, c in phrase_counter.most_common(80)
                 if ph not in stopwords and c >= 3]
     return filtered[:top_n]
+
+
+# ─── Prompt quality scoring (5-dimension model) ────────────────
+
+_GOAL_VERBS = re.compile(
+    r"我要|需要|目标|期望|希望|要求|实现|完成|修复|修改|添加|删除|优化|重构|部署|迁移|接入|开发|写|改|加|删|查|看|跑|测"
+    r"|implement|fix|add|remove|create|update|delete|refactor|deploy|build|write|check|debug|test|run|migrate"
+)
+_CONTEXT_KEYWORDS = re.compile(
+    r"因为|原因|背景|之前|目前|问题是|上下文|现在|由于|为了|鉴于|根据|参考|基于"
+    r"|because|since|currently|the issue is|context|background|previously|given that|based on|referring to"
+)
+_FILE_REF = re.compile(
+    r"(?:/[\w./-]+\.[\w]+|~/[\w./-]+|[\w]+\.(?:java|py|ts|js|tsx|jsx|md|json|xml|yml|yaml|html|css|sh|sql|go|rs|kt|swift|rb|php|c|cpp|h)(?::\d+)?|[\w]+#[\w]+)"
+)
+_CODE_SYMBOL = re.compile(r"[A-Z][a-zA-Z0-9]+[.#][a-zA-Z]\w+")
+
+
+def score_prompt_quality(text):
+    """Score a single prompt on 5 dimensions (0-100). Returns (score, breakdown)."""
+    text = text.strip()
+    if not text or text.startswith("/") or len(text) <= 2:
+        return None, None
+
+    length = len(text)
+    if length < 10:
+        d1 = 0
+    elif length < 20:
+        d1 = 5
+    elif length < 50:
+        d1 = 10
+    elif length <= 500:
+        d1 = 20
+    else:
+        d1 = 15
+
+    d2 = 25 if (_FILE_REF.search(text) or _CODE_SYMBOL.search(text)) else 0
+
+    goal_matches = _GOAL_VERBS.findall(text)
+    d3 = 20 if goal_matches else 0
+
+    d4 = 20 if _CONTEXT_KEYWORDS.search(text) else 0
+
+    goal_count = len(set(goal_matches))
+    if goal_count == 0:
+        d5 = 0
+    elif goal_count <= 2:
+        d5 = 15
+    elif goal_count == 3:
+        d5 = 10
+    else:
+        d5 = 5
+
+    total = d1 + d2 + d3 + d4 + d5
+    breakdown = {"length": d1, "reference": d2, "goal": d3, "context": d4, "focus": d5}
+    return total, breakdown
+
+
+def compute_prompt_quality_stats(prompts):
+    """Compute aggregate prompt quality statistics."""
+    scores = []
+    low_quality = []
+    vague_count = 0
+
+    for p in prompts:
+        text = p["text"].strip()
+        if not text or text.startswith("/") or text.startswith("<") or len(text) <= 2:
+            continue
+        score, breakdown = score_prompt_quality(text)
+        if score is None:
+            continue
+        scores.append(score)
+        if score < 40:
+            missing = [k for k, v in breakdown.items() if v == 0]
+            low_quality.append({"text": text[:100], "score": score, "missing": missing,
+                                "project": p.get("project", ""), "source": p.get("source", "")})
+        if len(text) > 10 and not _FILE_REF.search(text) and not _GOAL_VERBS.search(text):
+            vague_count += 1
+
+    if not scores:
+        return {}
+
+    dist = {"excellent_80_100": 0, "good_60_79": 0, "fair_40_59": 0, "poor_0_39": 0}
+    for s in scores:
+        if s >= 80:
+            dist["excellent_80_100"] += 1
+        elif s >= 60:
+            dist["good_60_79"] += 1
+        elif s >= 40:
+            dist["fair_40_59"] += 1
+        else:
+            dist["poor_0_39"] += 1
+
+    low_quality.sort(key=lambda x: x["score"])
+    return {
+        "avg_score": round(sum(scores) / len(scores), 1),
+        "total_scored": len(scores),
+        "score_distribution": dist,
+        "vagueness_rate": round(vague_count / max(len(scores), 1) * 100, 1),
+        "top_low_quality": low_quality[:5],
+    }
+
+
+# ─── Efficiency metrics ─────────────────────────────────────────
+
+_NEGATION_KEYWORDS = re.compile(
+    r"不对|不是|重[来做]|改一下|错了|换[一个种]|别这样|不要这[样么个]|重新"
+    r"|wrong|incorrect|undo|revert|redo|not right|start over|go back|that'?s not"
+)
+
+
+def compute_efficiency_stats(prompts):
+    """Compute conversation efficiency metrics."""
+    sessions = defaultdict(list)
+    for p in prompts:
+        sid = p.get("session_id", "")
+        if sid:
+            sessions[sid].append(p)
+
+    if not sessions:
+        return {}
+
+    total_sessions = len(sessions)
+    first_success = 0
+    negation_sessions = 0
+
+    for sid, ps in sessions.items():
+        real = [p for p in ps if not p["text"].startswith("/") and len(p["text"]) > 2
+                and not p["text"].startswith("<")]
+        has_negation = any(_NEGATION_KEYWORDS.search(p["text"]) for p in real)
+        if has_negation:
+            negation_sessions += 1
+        if len(real) <= 3 and not has_negation:
+            first_success += 1
+
+    first_success_rate = round(first_success / max(total_sessions, 1) * 100, 1)
+    negation_rate = round(negation_sessions / max(total_sessions, 1) * 100, 1)
+    efficiency_score = round(
+        (first_success / max(total_sessions, 1)) * 40
+        + (1 - negation_sessions / max(total_sessions, 1)) * 30
+        + 0.5 * 30, 1
+    )
+
+    return {
+        "first_success_rate": first_success_rate,
+        "negation_rate": negation_rate,
+        "efficiency_score": efficiency_score,
+        "total_sessions": total_sessions,
+        "first_success_count": first_success,
+        "negation_session_count": negation_sessions,
+    }
+
+
+# ─── Task type & collaboration style classification ──────────────
+
+_TASK_TYPE_PATTERNS = [
+    ("coding", re.compile(r"写代码|实现|开发|function|method|class|interface|import|def |编码|新增.*方法|enum|DTO|Service|Controller|API")),
+    ("debugging", re.compile(r"bug|error|报错|异常|不工作|fix|debug|trace|排查|问题|崩溃|失败|卡住|不生效|不好使")),
+    ("research", re.compile(r"搜索|调[查研]|查一下|对比|评估|怎么做|是什么|分析|全网检索|了解一下|调研|选型")),
+    ("writing", re.compile(r"写文[章档]|文档|总结|报告|博客|README|系分|沉淀|记录|公众号|PPT|汇报")),
+    ("configuration", re.compile(r"配置|安装|部署|环境|hook|settings|config|setup|install|deploy|发布|上线")),
+]
+
+
+def classify_task_type(text):
+    """Classify a prompt's task type by keyword matching."""
+    for task_type, pattern in _TASK_TYPE_PATTERNS:
+        if pattern.search(text):
+            return task_type
+    return "other"
+
+
+_COLLAB_STYLE_PATTERNS = [
+    ("delegation", re.compile(r"帮我|去做|给我|直接做|你来|你去|帮忙|替我|help me|do it|just do")),
+    ("collaborative", re.compile(r"我们|一起|想想|讨论|你觉得|商量|探讨|let'?s|what do you think|together|discuss")),
+    ("review", re.compile(r"检查|review|看看|审[一查]|cr|code review|check|inspect|verify|验证")),
+]
+
+
+def classify_collab_style(text):
+    """Classify collaboration style by keyword matching."""
+    for style, pattern in _COLLAB_STYLE_PATTERNS:
+        if pattern.search(text):
+            return style
+    return "directive"
+
+
+def compute_classification_stats(prompts):
+    """Compute task type and collaboration style distributions."""
+    task_dist = Counter()
+    style_dist = Counter()
+    for p in prompts:
+        text = p["text"].strip()
+        if not text or text.startswith("/") or text.startswith("<") or len(text) <= 2:
+            continue
+        task_dist[classify_task_type(text)] += 1
+        style_dist[classify_collab_style(text)] += 1
+    return {
+        "task_type": dict(task_dist.most_common()),
+        "collab_style": dict(style_dist.most_common()),
+    }
+
+
+# ─── Session-level anti-pattern detection ────────────────────────
+
+def detect_session_antipatterns(prompts):
+    """Detect user-side anti-patterns at the session level."""
+    sessions = defaultdict(list)
+    for p in prompts:
+        sid = p.get("session_id", "")
+        if sid:
+            sessions[sid].append(p)
+
+    results = []
+    type_counts = Counter()
+
+    for sid, ps in sessions.items():
+        real = [p for p in ps if not p["text"].startswith("/") and len(p["text"]) > 2
+                and not p["text"].startswith("<")]
+        if not real:
+            continue
+
+        project = real[0].get("project", "unknown")
+        source = real[0].get("source", "unknown")
+        detected = []
+
+        # 1. Negation loop: ≥2 consecutive negation prompts
+        consecutive_neg = 0
+        max_consecutive = 0
+        for p in real:
+            if _NEGATION_KEYWORDS.search(p["text"]):
+                consecutive_neg += 1
+                max_consecutive = max(max_consecutive, consecutive_neg)
+            else:
+                consecutive_neg = 0
+        if max_consecutive >= 2:
+            detected.append("negation_loop")
+
+        # 2. Short commands: ≥3 prompts < 10 chars (non-slash)
+        short_count = sum(1 for p in real if len(p["text"].strip()) < 10)
+        if short_count >= 3:
+            detected.append("short_commands")
+
+        # 3. Session bloat: > 50 turns
+        if len(real) > 50:
+            detected.append("session_bloat")
+
+        # 4. Goal drift: task type switches ≥ 3
+        if len(real) >= 4:
+            types = [classify_task_type(p["text"]) for p in real]
+            switches = sum(1 for i in range(1, len(types)) if types[i] != types[i - 1])
+            if switches >= 3:
+                detected.append("goal_drift")
+
+        for d in detected:
+            type_counts[d] += 1
+            if len(results) < 20:
+                results.append({"session_id": sid, "type": d, "project": project,
+                                "source": source, "turns": len(real)})
+
+    return {
+        "total_detected": sum(type_counts.values()),
+        "by_type": dict(type_counts),
+        "affected_sessions": results[:10],
+    }
 
 
 def discover_sources():
@@ -734,23 +1329,24 @@ def discover_sources():
             "context": "full_transcript_when_rollout_exists",
         }
 
-    cursor_dbs = glob.glob(str(Path.home() / "Library/Application Support/Cursor/User/**/state.vscdb"), recursive=True)
+    cursor_dbs = []
+    for d in CURSOR_DATA_DIRS:
+        cursor_dbs.extend(glob.glob(str(d / "User/**/state.vscdb"), recursive=True))
     if cursor_dbs or (Path.home() / ".cursor").exists():
-        cursor_prompt_count = len(load_cursor_prompts(days=None))
         sources["Cursor"] = {
             "source_id": "cursor",
-            "status": "best_effort" if cursor_prompt_count else "detected_metadata_only",
+            "status": "best_effort" if cursor_dbs else "detected_metadata_only",
             "db_count": len(cursor_dbs),
-            "prompt_count": cursor_prompt_count,
             "context": "sqlite_schema_varies",
         }
 
     cline_files = []
-    for root in [
-        Path.home() / "Library/Application Support/Code/User/globalStorage",
-        Path.home() / "Library/Application Support/Cursor/User/globalStorage",
-        Path.home() / ".vscode/extensions",
-    ]:
+    cline_roots = [Path.home() / ".vscode/extensions"]
+    for d in VSCODE_DATA_DIRS:
+        cline_roots.append(d / "User/globalStorage")
+    for d in CURSOR_DATA_DIRS:
+        cline_roots.append(d / "User/globalStorage")
+    for root in cline_roots:
         if root.exists():
             cline_files.extend(root.rglob("ui_messages.json"))
             cline_files.extend(root.rglob("api_conversation_history.json"))
@@ -759,7 +1355,6 @@ def discover_sources():
             "source_id": "cline-roo",
             "status": "best_effort" if cline_files else "detected_no_history",
             "history_file_count": len(cline_files),
-            "prompt_count": len(load_cline_roo_prompts(days=None)) if cline_files else 0,
             "context": "json_history",
         }
 
@@ -767,33 +1362,36 @@ def discover_sources():
         sources["Gemini CLI"] = {
             "source_id": "gemini",
             "status": "best_effort",
-            "prompt_count": len(load_gemini_prompts(days=None)),
             "context": "json_history_if_present",
         }
 
-    chatgpt_exports = list(Path.home().glob("Downloads/**/conversations.json"))
+    chatgpt_exports = list(Path.home().glob("Downloads/conversations.json")) + \
+                      list(Path.home().glob("Downloads/chatgpt-export/conversations.json"))
     if chatgpt_exports:
         sources["ChatGPT Export"] = {
             "source_id": "chatgpt-export",
             "status": "best_effort",
             "file_count": len(chatgpt_exports),
-            "prompt_count": len(load_chatgpt_export_prompts(days=None)),
             "context": "export_file",
         }
 
-    if (Path.home() / ".config/github-copilot").exists():
-        sources["GitHub Copilot"] = {
-            "source_id": "copilot",
-            "status": "detected_config_only",
-            "context": "no_stable_local_chat_parser",
+    qoder_transcripts = []
+    for base in [QODER_DIR / "projects", QODER_DIR / "cache" / "projects"]:
+        if base.exists():
+            qoder_transcripts.extend(base.rglob("*.jsonl"))
+    qoder_app_found = any(d.exists() for d in QODER_APP_DIRS)
+    if qoder_transcripts or qoder_app_found:
+        sources["Qoder"] = {
+            "source_id": "qoder",
+            "status": "full" if qoder_transcripts else "detected_app_only",
+            "transcript_count": len(qoder_transcripts),
+            "context": "full_transcript" if qoder_transcripts else "no_transcripts_found",
         }
 
     for path, label in [
         (Path.home() / ".continue", "Continue"),
         (Path.home() / ".aider.chat.history.md", "Aider"),
         (Path.home() / ".local/share/opencode", "OpenCode"),
-        (Path.home() / "Library/Application Support/Windsurf", "Windsurf"),
-        (Path.home() / "Library/Application Support/Claude", "Claude Desktop"),
     ]:
         if path.exists():
             sources[label] = {
@@ -808,7 +1406,7 @@ def discover_sources():
 
 # ─── Main flow ────────────────────────────────────────────────
 
-def analyze(days=30, project=None, deep=True, sources=None):
+def analyze(days=None, project=None, deep=True, sources=None):
     prompts = load_prompts(days=days, project=project, sources=sources)
     if not prompts:
         return {"error": "no_conversation_data_found", "data_sources": discover_sources()}
@@ -823,17 +1421,32 @@ def analyze(days=30, project=None, deep=True, sources=None):
 
     # Helper stats
     session_stats = compute_session_stats(prompts)
+    model_stats = compute_model_stats(prompts, signals)
     high_freq = compute_high_frequency_phrases(prompts)
+    prompt_quality = compute_prompt_quality_stats(prompts)
+    efficiency = compute_efficiency_stats(prompts)
+    classifications = compute_classification_stats(prompts)
+    antipatterns = detect_session_antipatterns(prompts)
 
-    # Count frustration signals by project
+    # Per-project stats: total prompts + frustration count + rate
+    project_prompts = Counter(p["project"] for p in prompts)
     project_frustration = Counter()
     for s in signals:
         project_frustration[s["project"]] += 1
+    project_stats = {}
+    for proj, frust_count in project_frustration.most_common(10):
+        total = project_prompts.get(proj, 0)
+        project_stats[proj] = {
+            "total_prompts": total,
+            "frustration_count": frust_count,
+            "frustration_rate": round(frust_count / max(total, 1) * 100, 1),
+        }
 
     return {
         "period": {
-            "start": (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d"),
+            "start": (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d") if days else prompts[0]["timestamp"][:10] if prompts and prompts[0].get("timestamp") else "unknown",
             "end": datetime.now().strftime("%Y-%m-%d"),
+            "all_time": days is None,
         },
         "overview": {
             "total_prompts": len(prompts),
@@ -846,13 +1459,14 @@ def analyze(days=30, project=None, deep=True, sources=None):
             "total_signals": len(signals),
             "category_counts": category_counts,
             "frustration_rate": round(len(signals) / max(len(prompts), 1) * 100, 1),
-            "top_projects": dict(project_frustration.most_common(5)),
+            "top_projects": project_stats,
             "signals_sample": [
                 {"category": s["category"], "prompt": s["full_prompt"][:150],
                  "source": s.get("source"), "project": s["project"], "timestamp": s["timestamp"]}
                 for s in signals[:20]
             ],
         },
+        "model_stats": model_stats,
         "layer2_incidents": [
             {
                 "category": inc["category"],
@@ -867,6 +1481,11 @@ def analyze(days=30, project=None, deep=True, sources=None):
         ],
         "session_stats": session_stats,
         "high_frequency_phrases": high_freq,
+        "prompt_quality": prompt_quality,
+        "efficiency": efficiency,
+        "task_type_distribution": classifications.get("task_type", {}),
+        "collab_style_distribution": classifications.get("collab_style", {}),
+        "session_antipatterns": antipatterns,
     }
 
 
@@ -874,24 +1493,24 @@ def scope_check():
     """Stage 0: Determine analysis scope."""
     sources = discover_sources()
     counts = {}
-    for label, days in [("15d", 15), ("30d", 30), ("60d", 60)]:
+    for label, days in [("30d", 30), ("60d", 60), ("90d", 90)]:
         prompts = load_prompts(days=days)
         counts[label] = len(prompts)
 
-    recommended = 30
-    if counts["30d"] > 500:
-        recommended = 15
-    elif counts["30d"] < 50:
-        recommended = 60
+    recommended = 60
+    if counts["60d"] > 3000:
+        recommended = 30
+    elif counts["60d"] < 300:
+        recommended = 180
 
     return {
         "data_sources": sources,
         "prompt_counts": counts,
-        "source_counts_30d": dict(Counter(p.get("source", "unknown") for p in load_prompts(days=30))),
+        "source_counts_60d": dict(Counter(p.get("source", "unknown") for p in load_prompts(days=60))),
         "recommended_days": recommended,
-        "reason": f"30d has {counts['30d']} prompts" + (
-            ", too many — shrink to 15d" if recommended == 15 else
-            ", too few — expand to 60d" if recommended == 60 else
+        "reason": f"60d has {counts['60d']} prompts" + (
+            ", too many — shrink to 30d" if recommended == 30 else
+            ", too few — expand to 180d" if recommended == 180 else
             ", good volume"
         ),
     }
@@ -1109,6 +1728,122 @@ def extract_codex_context(session_id, target_prompt_text, radius=4):
     }
 
 
+def extract_qoder_context(session_id, target_prompt_text, radius=4):
+    """Extract conversation context from Qoder JSONL transcripts."""
+    # Find the transcript file by session_id
+    transcript_file = None
+    for base in [QODER_DIR / "projects", QODER_DIR / "cache" / "projects"]:
+        if not base.exists():
+            continue
+        for jsonl in base.rglob("*.jsonl"):
+            if session_id in jsonl.stem:
+                transcript_file = jsonl
+                break
+        if transcript_file:
+            break
+
+    if not transcript_file:
+        return {"error": "qoder_transcript_not_found", "session_id": session_id, "source_id": "qoder"}
+
+    msgs = []
+    try:
+        with open(transcript_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                t = obj.get("type", "")
+                msg = obj.get("message", {})
+                if not isinstance(msg, dict):
+                    continue
+
+                if t == "user":
+                    content = msg.get("content", "")
+                    text = ""
+                    if isinstance(content, str):
+                        text = content.strip()
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text = (block.get("content", "") or block.get("text", "")).strip()
+                                break
+                    if text and len(text) > 2 and not text.startswith("Command completed") and not text.startswith("Contents of /"):
+                        msgs.append({"role": "user", "content": text[:500]})
+
+                elif t == "assistant":
+                    content = msg.get("content", [])
+                    summary_parts = []
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict):
+                                if block.get("type") == "text":
+                                    txt = (block.get("text", "") or block.get("content", ""))[:300]
+                                    if txt.strip():
+                                        summary_parts.append(txt)
+                                elif block.get("type") == "tool_use":
+                                    name = block.get("name", "?")
+                                    inp = block.get("input", {})
+                                    if name in ("read_file", "Read", "Edit", "Write", "SearchReplace"):
+                                        fp = str(inp.get("file_path", "?")).split("/")[-1]
+                                        summary_parts.append(f"{name}({fp})")
+                                    elif name in ("Bash", "run_in_terminal"):
+                                        cmd = str(inp.get("command", ""))[:60]
+                                        summary_parts.append(f"Bash({cmd})")
+                                    else:
+                                        summary_parts.append(name)
+                    elif isinstance(content, str) and content.strip():
+                        summary_parts.append(content[:300])
+                    if summary_parts:
+                        msgs.append({"role": "assistant", "content": " | ".join(summary_parts[:3])})
+    except OSError:
+        return {"error": "qoder_transcript_read_error", "session_id": session_id, "source_id": "qoder"}
+
+    if not msgs:
+        return {"error": "qoder_context_empty", "session_id": session_id, "source_id": "qoder"}
+
+    # Find target message
+    target_idx = None
+    target_short = target_prompt_text[:40]
+    for i, m in enumerate(msgs):
+        if m["role"] == "user" and target_short in m["content"]:
+            target_idx = i
+            break
+
+    if target_idx is None:
+        import difflib
+        best_ratio = 0
+        for i, m in enumerate(msgs):
+            if m["role"] != "user":
+                continue
+            ratio = difflib.SequenceMatcher(None, target_short, m["content"][:40]).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                target_idx = i
+
+    if target_idx is None:
+        return {"error": "target_not_found", "session_id": session_id, "source_id": "qoder"}
+
+    start = max(0, target_idx - radius)
+    end = min(len(msgs), target_idx + radius + 1)
+    return {
+        "session_id": session_id,
+        "source_id": "qoder",
+        "transcript_path": str(transcript_file),
+        "total_messages": len(msgs),
+        "target_index": target_idx,
+        "context_radius": radius,
+        "context": [
+            {**msgs[i], "is_target": i == target_idx, "position": i - target_idx}
+            for i in range(start, end)
+        ],
+    }
+
+
 def extract_context(session_id, target_prompt_text, radius=4, source=None):
     source = (source or "").lower()
     if source in ("", "claude-code", "claude"):
@@ -1121,6 +1856,10 @@ def extract_context(session_id, target_prompt_text, radius=4, source=None):
         ctx = extract_codex_context(session_id, target_prompt_text, radius)
         if source == "codex" or not ctx.get("error"):
             return ctx
+    if source in ("", "qoder"):
+        ctx = extract_qoder_context(session_id, target_prompt_text, radius)
+        if source == "qoder" or not ctx.get("error"):
+            return ctx
     return {
         "error": "context_not_supported_for_source",
         "source_id": source or "unknown",
@@ -1132,7 +1871,7 @@ def extract_context(session_id, target_prompt_text, radius=4, source=None):
 def main():
     parser = argparse.ArgumentParser(description="AI Interaction Analyzer v4")
     parser.add_argument("--mode", choices=["analyze", "setup", "signals", "scope", "context"], default="analyze")
-    parser.add_argument("--days", type=int, default=30)
+    parser.add_argument("--days", type=int, default=None, help="analysis window in days (omit for all data)")
     parser.add_argument("--project", type=str, default=None)
     parser.add_argument("--source", type=str, default=None, help="comma-separated source ids, e.g. claude-code,codex")
     parser.add_argument("--session", type=str, default=None, help="session ID for context extraction")
@@ -1174,6 +1913,11 @@ def main():
                         "project": real[0]["project"],
                     })
 
+        pq = compute_prompt_quality_stats(prompts)
+        eff = compute_efficiency_stats(prompts)
+        cls = compute_classification_stats(prompts)
+        ap = detect_session_antipatterns(prompts)
+
         print(json.dumps({
             "total_prompts": len(prompts),
             "frustration": {"total": len(signals), "categories": counts,
@@ -1183,6 +1927,22 @@ def main():
                             for s in signals]},
             "success": {"total": len(quick_wins),
                 "sessions": quick_wins[:10]},
+            "prompt_quality_summary": {
+                "avg_score": pq.get("avg_score"),
+                "distribution": pq.get("score_distribution"),
+                "vagueness_rate": pq.get("vagueness_rate"),
+            } if pq else None,
+            "task_type_distribution": cls.get("task_type", {}),
+            "collab_style_distribution": cls.get("collab_style", {}),
+            "efficiency_summary": {
+                "first_success_rate": eff.get("first_success_rate"),
+                "negation_rate": eff.get("negation_rate"),
+                "efficiency_score": eff.get("efficiency_score"),
+            } if eff else None,
+            "session_antipatterns_summary": {
+                "total": ap.get("total_detected", 0),
+                "by_type": ap.get("by_type", {}),
+            } if ap else None,
         }, ensure_ascii=False, indent=2))
 
     elif args.mode == "context":
