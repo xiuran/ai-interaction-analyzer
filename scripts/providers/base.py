@@ -2,6 +2,8 @@
 Shared utilities for all providers.
 """
 
+import os
+import sys
 import json
 import glob
 import re
@@ -14,10 +16,28 @@ from pathlib import Path
 
 CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
-QODER_DIR = Path.home() / "Library/Application Support/Qoder"
+QODER_DIR = Path.home() / ".qoder"   # full plaintext JSONL transcripts live here
 SKILL_DIR = Path(__file__).resolve().parent.parent.parent
 CONFIG_DIR = SKILL_DIR / "config"
 USER_CONFIG_DIR = Path.home() / ".config" / "ai-interaction-analyzer"
+
+
+def _app_data_dirs(app_name):
+    """Platform-specific application data directories for a given app."""
+    home = Path.home()
+    if sys.platform == "darwin":
+        return [home / "Library/Application Support" / app_name]
+    elif sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", str(home / "AppData/Roaming"))
+        localappdata = os.environ.get("LOCALAPPDATA", str(home / "AppData/Local"))
+        return [Path(appdata) / app_name, Path(localappdata) / app_name]
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))
+        return [Path(xdg) / app_name]
+
+
+CURSOR_DATA_DIRS = _app_data_dirs("Cursor")
+QODER_APP_DIRS = _app_data_dirs("Qoder")
 
 
 # ─── Custom config ────────────────────────────────────────────
@@ -133,6 +153,18 @@ def parse_sources(value):
     if not value:
         return None
     return {x.strip().lower() for x in value.split(",") if x.strip()}
+
+
+def distinctive_term(text):
+    """A grep-safe, single-line slice of a prompt used to locate it in a
+    transcript. Empty for placeholder prompts (pasted text / images / tags),
+    which cannot be matched against transcript content."""
+    t = (text or "").strip()
+    if not t or t.startswith("[Pasted") or t.startswith("[Image") or t.startswith("<"):
+        return ""
+    first_line = t.splitlines()[0].strip()
+    term = first_line if len(first_line) >= 6 else t
+    return term[:40]
 
 
 # ─── Generic JSON user message extractor ─────────────────────

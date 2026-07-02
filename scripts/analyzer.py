@@ -24,33 +24,18 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import mean
 
+# Source-specific loading / context / model extraction lives in providers/;
+# analyzer.py owns the source-agnostic analysis engine and delegates data access.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from providers import (  # noqa: E402
+    load_prompts, discover_sources, extract_context, extract_model,
+)
+
 CLAUDE_DIR = Path.home() / ".claude"
-CODEX_DIR = Path.home() / ".codex"
-QODER_DIR = Path.home() / ".qoder"
 SKILL_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = SKILL_DIR / "config"
 USER_CONFIG_DIR = Path.home() / ".config" / "ai-interaction-analyzer"
 
-
-def _app_data_dirs(app_name):
-    """Return platform-specific application data directories for a given app.
-    Returns a list of candidate paths (first existing one wins at call sites).
-    """
-    home = Path.home()
-    if sys.platform == "darwin":
-        return [home / "Library/Application Support" / app_name]
-    elif sys.platform == "win32":
-        appdata = os.environ.get("APPDATA", str(home / "AppData/Roaming"))
-        localappdata = os.environ.get("LOCALAPPDATA", str(home / "AppData/Local"))
-        return [Path(appdata) / app_name, Path(localappdata) / app_name]
-    else:  # Linux / other
-        xdg = os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))
-        return [Path(xdg) / app_name]
-
-
-CURSOR_DATA_DIRS = _app_data_dirs("Cursor")
-VSCODE_DATA_DIRS = _app_data_dirs("Code")
-QODER_APP_DIRS = _app_data_dirs("Qoder")
 
 # ─── Custom config ────────────────────────────────────────────
 
@@ -67,97 +52,174 @@ def load_custom_config():
 CUSTOM = load_custom_config()
 
 
-def parse_sources(value):
-    if not value:
-        return None
-    return {x.strip().lower() for x in value.split(",") if x.strip()}
+# ─── AI-side anti-pattern library ─────────────────────────────
+# Loaded from references/antipatterns.json. An incident's user-correction text
+# is matched against these patterns; on a hit the curated root_cause + fix_rule
+# are attached to the incident. Unmatched incidents fall back to LLM analysis.
+
+REFERENCES_DIR = SKILL_DIR / "references"
 
 
-def coerce_ts_ms(value):
-    """Normalize seconds/ms/ISO timestamps to epoch milliseconds."""
-    if value is None or value == "":
+def _compile_antipattern_entries(entries, default_id="custom"):
+    compiled = []
+    for entry in entries or []:
+        det = entry.get("detection", "")
+        if not det:
+            continue
+        try:
+            rx = re.compile(det, re.IGNORECASE)
+        except re.error:
+            continue
+        compiled.append({
+            "id": entry.get("id", default_id),
+            "label": entry.get("label", {}),
+            "regex": rx,
+            "root_cause": entry.get("root_cause", {}),
+            "fix_rule": entry.get("fix_rule", {}),
+            "scenario": entry.get("scenario", {}),
+        })
+    return compiled
+
+
+def load_antipatterns():
+    """Load the AI-side anti-pattern library (shipped + user-contributed)."""
+    patterns = []
+    f = REFERENCES_DIR / "antipatterns.json"
+    if f.exists():
+        try:
+            data = json.load(open(f, encoding="utf-8"))
+            patterns.extend(_compile_antipattern_entries(data.get("ai_side")))
+        except Exception:
+            pass
+    # Users can extend recall without touching shipped files.
+    patterns.extend(_compile_antipattern_entries(CUSTOM.get("extra_antipatterns")))
+    return patterns
+
+
+ANTIPATTERNS = load_antipatterns()
+
+
+def match_antipatterns(*texts):
+    """Match text(s) against the AI-side library. Returns matched pattern dicts."""
+    blob = " ".join(t for t in texts if t)
+    if not blob.strip() or not ANTIPATTERNS:
+        return []
+    matched = []
+    for p in ANTIPATTERNS:
+        m = p["regex"].search(blob)
+        if m:
+            matched.append({
+                "id": p["id"],
+                "label": p["label"],
+                "root_cause": p["root_cause"],
+                "fix_rule": p["fix_rule"],
+                "scenario": p["scenario"],
+                "matched_signal": m.group()[:40],
+            })
+    return matched
+
+
+def _span_days(timestamps):
+    """Days between earliest and latest ISO timestamp in the list."""
+    ds = []
+    for t in timestamps:
+        if not t:
+            continue
+        try:
+            ds.append(datetime.fromisoformat(str(t).replace("Z", "+00:00")))
+        except (ValueError, TypeError):
+            continue
+    if len(ds) < 2:
         return 0
-    if isinstance(value, (int, float)):
-        return int(value if value > 10_000_000_000 else value * 1000)
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return 0
-        if re.fullmatch(r"\d+(\.\d+)?", s):
-            return coerce_ts_ms(float(s))
-        try:
-            return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() * 1000)
-        except ValueError:
-            return 0
-    return 0
+    return (max(ds) - min(ds)).days
 
 
-def iso_from_ms(ts_ms):
-    if not ts_ms:
-        return ""
-    return datetime.fromtimestamp(ts_ms / 1000).isoformat()
+def scan_antipattern_matches(signals):
+    """Match every frustration signal against the AI-side library.
+
+    Returns a list keyed by pattern id, each with the pattern metadata plus
+    cross-session reach: how many times it fired, across how many projects and
+    sessions, and over how many days. One known root cause spanning many
+    projects over weeks is a far sharper signal than a raw count.
+    """
+    by_id = {}
+    for s in signals:
+        for m in match_antipatterns(s.get("full_prompt", "")):
+            slot = by_id.get(m["id"])
+            if slot is None:
+                slot = {
+                    "id": m["id"],
+                    "label": m["label"],
+                    "root_cause": m["root_cause"],
+                    "fix_rule": m["fix_rule"],
+                    "scenario": m["scenario"],
+                    "count": 0,
+                    "projects": set(),
+                    "sessions": set(),
+                    "timestamps": [],
+                    "examples": [],
+                }
+                by_id[m["id"]] = slot
+            slot["count"] += 1
+            if s.get("project"):
+                slot["projects"].add(s["project"])
+            if s.get("session_id"):
+                slot["sessions"].add(s["session_id"])
+            if s.get("timestamp"):
+                slot["timestamps"].append(s["timestamp"])
+            if len(slot["examples"]) < 5:
+                slot["examples"].append({
+                    "project": s.get("project", ""),
+                    "source": s.get("source", ""),
+                    "prompt": s.get("full_prompt", "")[:150],
+                    "timestamp": s.get("timestamp"),
+                })
+    result = []
+    for slot in by_id.values():
+        slot["project_count"] = len(slot["projects"])
+        slot["session_count"] = len(slot["sessions"])
+        slot["span_days"] = _span_days(slot["timestamps"])
+        slot["projects"] = sorted(slot["projects"])
+        del slot["sessions"]
+        del slot["timestamps"]
+        result.append(slot)
+    # Rank by reach: recurring + widespread first, not just frequent.
+    result.sort(key=lambda x: (x["project_count"], x["count"]), reverse=True)
+    return result
 
 
-def cutoff_ms(days):
-    return int((datetime.now() - timedelta(days=days)).timestamp() * 1000) if days else 0
+def compute_recurring_categories(signals):
+    """Coarse cross-session view over ALL frustration signals by category.
 
+    Complements the anti-pattern library: it covers the signals that do NOT
+    match a known pattern, surfacing which problem *types* keep recurring
+    across projects and time. Root cause here is a theme, not a vetted rule —
+    the LLM still deep-dives these.
+    """
+    by_cat = defaultdict(lambda: {"count": 0, "projects": set(),
+                                  "sessions": set(), "timestamps": []})
+    for s in signals:
+        cat = s.get("category", "unknown")
+        slot = by_cat[cat]
+        slot["count"] += 1
+        if s.get("project"):
+            slot["projects"].add(s["project"])
+        if s.get("session_id"):
+            slot["sessions"].add(s["session_id"])
+        if s.get("timestamp"):
+            slot["timestamps"].append(s["timestamp"])
+    result = []
+    for cat, slot in by_cat.items():
+        result.append({
+            "category": cat,
+            "count": slot["count"],
+            "project_count": len(slot["projects"]),
+            "session_count": len(slot["sessions"]),
+            "span_days": _span_days(slot["timestamps"]),
+        })
+    result.sort(key=lambda x: (x["project_count"], x["count"]), reverse=True)
+    return result
 
-def make_prompt_record(source_id, source_name, text, timestamp_ms=0, project="unknown",
-                       session_id="", message_id="", transcript_path="", metadata=None):
-    return {
-        "source_id": source_id,
-        "source": source_name,
-        "text": (text or "").strip(),
-        "timestamp_ms": int(timestamp_ms or 0),
-        "timestamp": iso_from_ms(timestamp_ms),
-        "project": project or "unknown",
-        "session_id": session_id or "",
-        "message_id": message_id or "",
-        "transcript_path": transcript_path or "",
-        "metadata": metadata or {},
-    }
-
-
-def iter_jsonl(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        return
-
-
-def sqlite_fetch(path, sql, params=()):
-    if not path.exists():
-        return []
-    try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        try:
-            return list(conn.execute(sql, params))
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        return []
-
-
-def text_from_blocks(content):
-    if isinstance(content, str):
-        return content
-    parts = []
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            txt = block.get("text") or block.get("input_text") or block.get("output_text")
-            if txt:
-                parts.append(str(txt))
-    return "\n".join(parts)
 
 # ─── Frustration signal patterns (Layer 1 core) ──────────────
 
@@ -267,516 +329,157 @@ def classify_frustration(text):
     return hits
 
 
-# ─── Data loading: Provider-based ─────────────────────────────
+# ─── Positive signal detection ──────────────────────────────────
 
-def load_claude_prompts(days=None, project=None):
-    """Load prompt index from Claude Code history.jsonl."""
-    history = CLAUDE_DIR / "history.jsonl"
-    if not history.exists():
-        return []
-    cutoff = cutoff_ms(days)
-    records = []
-    with open(history, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                obj = json.loads(line.strip())
-                ts = obj.get("timestamp", 0)
-                if ts < cutoff: continue
-                text = obj.get("display", "").strip()
-                if not text: continue
-                proj = obj.get("project", "")
-                if project and project not in proj: continue
-                records.append(make_prompt_record(
-                    "claude-code", "Claude Code", text, ts,
-                    proj.split("/")[-1] if proj else "unknown",
-                    obj.get("sessionId", ""),
-                    metadata={"project_path": proj},
-                ))
-            except: continue
-    return records
-
-
-def load_codex_thread_index():
-    """Read Codex thread metadata to correlate history prompts with cwd/title/rollout."""
-    index = {}
-    for db in [CODEX_DIR / "sqlite/state_5.sqlite", CODEX_DIR / "state_5.sqlite"]:
-        rows = sqlite_fetch(
-            db,
-            "select id, cwd, title, rollout_path from threads"
-        )
-        for sid, cwd, title, rollout_path in rows:
-            index[sid] = {
-                "cwd": cwd or "",
-                "title": title or "",
-                "rollout_path": rollout_path or "",
-            }
-    return index
+POSITIVE_CATEGORIES = {
+    "praise": {
+        "label": {"en": "Praise / approval", "zh": "认可/夸赞"},
+        "pattern": re.compile(
+            r"[很挺非常]好|不错|可以|完美|正确|对了|牛|厉害|优秀|准确|满意|靠谱"
+            r"|perfect|great|good|nice|exactly|correct|well done|awesome|impressive"
+            r"|这次[很挺]好|比之前好|终于对了|这样[就对]|就是这[个样]|漂亮"
+        ),
+    },
+    "trust_delegation": {
+        "label": {"en": "Trust delegation", "zh": "信任委托"},
+        "pattern": re.compile(
+            r"你[自己直接].*[做弄改写搞处理决定判断]|交给你|你来[决定判断]|你看着[办弄]|按你[的说]"
+            r"|自己想办法|你全权|放手[做干]|I trust you|up to you|your call|go ahead"
+            r"|就按你说的|听你的|你拿主意"
+        ),
+    },
+    "reuse_pattern": {
+        "label": {"en": "Pattern reuse", "zh": "复用/引用已有方案"},
+        "pattern": re.compile(
+            r"参考[之前上次]|像[之上]次[那一]样|用[之上]次的|按[之上]次的|复用|沿用|跟之前一样"
+            r"|same as before|like last time|reuse|follow the same|as we did"
+            r"|之前的[方案思路做法]|还是[用那][之上]次"
+        ),
+    },
+    "skill_invocation": {
+        "label": {"en": "Skill / workflow invocation", "zh": "Skill/工作流调用"},
+        "pattern": re.compile(
+            r"使用.*skill|执行.*skill|skill.*自循环|用.*skill|跑.*skill"
+            r"|/[a-z][\w-]{2,}|run.*skill|use.*skill|invoke.*skill"
+        ),
+    },
+    "context_engineering": {
+        "label": {"en": "Context engineering", "zh": "主动提供上下文"},
+        "pattern": re.compile(
+            r"\[Pasted text.*\]|\[Image.*\]|参考.*https?://|读取.*\.md|看一下.*代码"
+            r"|这是.*日志|这是.*报错|这是.*数据|以下是|如下[：:]"
+        ),
+    },
+}
 
 
-def find_codex_rollout(session_id, thread_index=None):
-    if thread_index and session_id in thread_index:
-        p = Path(thread_index[session_id].get("rollout_path") or "")
-        if p.exists():
-            return str(p)
-    patterns = [
-        str(CODEX_DIR / f"sessions/**/rollout-*{session_id}.jsonl"),
-        str(CODEX_DIR / f"archived_sessions/rollout-*{session_id}.jsonl"),
-    ]
-    for pattern in patterns:
-        matches = glob.glob(pattern, recursive=True)
-        if matches:
-            return matches[0]
-    return ""
+def classify_positive(text):
+    """Classify positive signals. Returns [(category, matched_text)]."""
+    hits = []
+    for cat, info in POSITIVE_CATEGORIES.items():
+        match = info["pattern"].search(text)
+        if match:
+            hits.append((cat, match.group()))
+    return hits
 
 
-def load_codex_prompts(days=None, project=None):
-    """Load Codex history.jsonl. Full context located via rollout_path."""
-    history = CODEX_DIR / "history.jsonl"
-    if not history.exists():
-        return []
-    cutoff = cutoff_ms(days)
-    thread_index = load_codex_thread_index()
-    records = []
-    for obj in iter_jsonl(history):
-        ts = coerce_ts_ms(obj.get("ts"))
-        if ts < cutoff:
+def scan_positive_signals(prompts):
+    """Scan all prompts for positive interaction signals."""
+    signals = []
+    category_counts = Counter()
+    neg_re = re.compile(r'不对|错了|瞎|重[来做]|撤销|恢复|胡编|别瞎|不是|不要|不行')
+
+    for p in prompts:
+        text = p["text"].strip()
+        if not text or text.startswith("/") or text.startswith("<") or len(text) <= 3:
             continue
-        text = (obj.get("text") or "").strip()
-        if not text:
+        if neg_re.search(text):
             continue
-        sid = obj.get("session_id", "")
-        meta = thread_index.get(sid, {})
-        cwd = meta.get("cwd", "")
-        title = meta.get("title", "")
-        if project and project not in cwd and project not in title:
-            continue
-        project_name = Path(cwd).name if cwd else (title[:40] if title else "unknown")
-        records.append(make_prompt_record(
-            "codex", "Codex", text, ts, project_name, sid,
-            transcript_path=find_codex_rollout(sid, thread_index),
-            metadata={"cwd": cwd, "title": title},
-        ))
-    return records
+        hits = classify_positive(text)
+        for cat, matched in hits:
+            category_counts[cat] += 1
+            signals.append({
+                "category": cat,
+                "matched": matched,
+                "full_prompt": text,
+                "source": p.get("source"),
+                "source_id": p.get("source_id"),
+                "project": p.get("project", ""),
+                "session_id": p.get("session_id", ""),
+                "timestamp": p.get("timestamp"),
+            })
 
-
-def extract_json_user_messages(obj, inherited_session="", source_hint=""):
-    """Best-effort extractor for Cursor/Cline/Roo/Gemini/ChatGPT export-like JSON."""
-    found = []
-
-    def text_value(value):
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            return text_from_blocks(value)
-        if isinstance(value, dict):
-            for key in ("text", "content", "message", "prompt", "query"):
-                if isinstance(value.get(key), str):
-                    return value[key]
-        return ""
-
-    def walk(node, session_id):
-        if isinstance(node, dict):
-            sid = str(node.get("sessionId") or node.get("session_id") or node.get("conversation_id")
-                      or node.get("composerId") or node.get("id") or session_id or inherited_session)
-            role = str(node.get("role") or node.get("author") or node.get("sender") or "").lower()
-            if role in ("user", "human"):
-                text = text_value(node.get("content") or node.get("text") or node.get("message") or node)
-                ts = coerce_ts_ms(node.get("timestamp") or node.get("createdAt") or node.get("create_time"))
-                if text and len(text.strip()) > 1:
-                    found.append((sid, text.strip(), ts))
-            for value in node.values():
-                walk(value, sid)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item, session_id)
-
-    walk(obj, inherited_session)
-    dedup = []
     seen = set()
-    for sid, text, ts in found:
-        key = (sid, text[:120], ts)
+    deduped = []
+    for s in signals:
+        key = (s.get("source_id"), s["session_id"], s["category"])
         if key not in seen:
             seen.add(key)
-            dedup.append((sid, text, ts))
-    return dedup
+            deduped.append(s)
+
+    return deduped, dict(category_counts)
 
 
-def load_cursor_prompts(days=None, project=None):
-    """Best-effort Cursor SQLite reader. Schema varies across versions."""
-    cutoff = cutoff_ms(days)
-    roots = []
-    for d in CURSOR_DATA_DIRS:
-        roots.append(d / "User/globalStorage/state.vscdb")
-        roots.extend(glob.glob(str(d / "User/workspaceStorage/*/state.vscdb")))
-    records = []
-    for db in roots:
-        db = Path(db)
-        workspace = db.parent.name if db.parent.name != "globalStorage" else "global"
+# ─── User cognitive pattern detection ───────────────────────────
 
-        # Cursor stores prompts in aiService.prompts / aiService.generations
-        gen_index = {}
-        gen_rows = sqlite_fetch(db, "select value from ItemTable where key='aiService.generations'")
-        for (val,) in gen_rows:
-            try:
-                for g in json.loads(val):
-                    desc = (g.get("textDescription") or "").strip()
-                    if desc:
-                        gen_index[desc[:80]] = coerce_ts_ms(g.get("unixMs"))
-            except (TypeError, json.JSONDecodeError):
-                pass
-
-        prompt_rows = sqlite_fetch(db, "select value from ItemTable where key='aiService.prompts'")
-        for (val,) in prompt_rows:
-            try:
-                for p in json.loads(val):
-                    text = (p.get("text") or "").strip()
-                    if not text or len(text) < 3:
-                        continue
-                    ts = gen_index.get(text[:80], 0)
-                    if cutoff and ts and ts < cutoff:
-                        continue
-                    if project and project not in workspace:
-                        continue
-                    records.append(make_prompt_record(
-                        "cursor", "Cursor", text, ts, workspace, "",
-                        metadata={"db": str(db), "key": "aiService.prompts"},
-                    ))
-            except (TypeError, json.JSONDecodeError):
-                pass
-
-        # Also check legacy chat/composer keys
-        rows = sqlite_fetch(
-            db,
-            "select key, value from ItemTable where lower(key) like '%chat%' "
-            "or lower(key) like '%composer%' or lower(key) like '%conversation%'"
-        )
-        for key, value in rows:
-            try:
-                obj = json.loads(value)
-            except (TypeError, json.JSONDecodeError):
-                continue
-            for sid, text, ts in extract_json_user_messages(obj, inherited_session=str(key), source_hint="cursor"):
-                if cutoff and ts and ts < cutoff:
-                    continue
-                if project and project not in workspace and project not in str(db):
-                    continue
-                records.append(make_prompt_record(
-                    "cursor", "Cursor", text, ts, workspace, sid,
-                    metadata={"db": str(db), "key": key},
-                ))
-    return records
+COGNITIVE_PATTERNS = {
+    "depth_demand": {
+        "label": {"en": "Demands deep thinking", "zh": "要求深度思考"},
+        "pattern": re.compile(r"深度思考|仔细[想看分析]|认真[点一]|动动脑|用心|全面分析|彻底|think deeply|think harder|carefully"),
+    },
+    "quality_standard": {
+        "label": {"en": "High quality bar", "zh": "高质量标准"},
+        "pattern": re.compile(r"审美|好看|优雅|专业|高质量|生产[环级]|不够好|太[差丑简陋粗糙]|品质|精细|打磨"),
+    },
+    "autonomy_expectation": {
+        "label": {"en": "Expects AI autonomy", "zh": "期望AI自主"},
+        "pattern": re.compile(r"自己[想做弄决定判断]|别[问老]是问|不要.*问我|自[主动]|主动|智[慧能]一[些点]|别等我"),
+    },
+    "persistence_demand": {
+        "label": {"en": "Demands persistence", "zh": "要求坚持/重试"},
+        "pattern": re.compile(r"反复[重尝试]|[重再]试|不要放弃|想办法|多试[几几种]|穷举|别.*放弃|keep trying|don.?t give up"),
+    },
+    "holistic_thinking": {
+        "label": {"en": "Holistic / system thinking", "zh": "全局/系统思维"},
+        "pattern": re.compile(r"全[局面]|整体|一致[性]|统一|保[持鲜]|端到端|闭环|体系|系统[性地化]|全链路"),
+    },
+    "asset_mindset": {
+        "label": {"en": "Asset / accumulation mindset", "zh": "资产/沉淀思维"},
+        "pattern": re.compile(r"沉淀|积累|可复用|资产|长期|持久|知识[库管理]|经验.*[总结提炼]|方法论"),
+    },
+}
 
 
-def load_json_file_prompts(source_id, source_name, paths, days=None, project=None):
-    cutoff = cutoff_ms(days)
-    records = []
-    for path in paths:
-        path = Path(path)
-        if not path.exists() or not path.is_file():
+def detect_cognitive_patterns(prompts):
+    """Detect user's cognitive patterns from prompt text."""
+    pattern_counts = Counter()
+    pattern_examples = defaultdict(list)
+
+    for p in prompts:
+        text = p["text"].strip()
+        if not text or text.startswith("/") or text.startswith("<") or len(text) <= 5:
             continue
-        objs = []
-        if path.suffix == ".jsonl":
-            objs = list(iter_jsonl(path))
-        else:
-            try:
-                objs = [json.load(open(path, encoding="utf-8"))]
-            except (OSError, json.JSONDecodeError):
-                continue
-        for obj in objs:
-            for sid, text, ts in extract_json_user_messages(obj, inherited_session=path.parent.name, source_hint=source_id):
-                if cutoff and ts and ts < cutoff:
-                    continue
-                proj = path.parent.name
-                if project and project not in proj and project not in str(path):
-                    continue
-                records.append(make_prompt_record(
-                    source_id, source_name, text, ts, proj, sid,
-                    transcript_path=str(path),
-                    metadata={"path": str(path)},
-                ))
-    return records
+        for pat_name, info in COGNITIVE_PATTERNS.items():
+            if info["pattern"].search(text):
+                pattern_counts[pat_name] += 1
+                if len(pattern_examples[pat_name]) < 3:
+                    pattern_examples[pat_name].append(text[:150])
+
+    total_prompts = sum(1 for p in prompts if len(p["text"].strip()) > 5
+                        and not p["text"].startswith("/") and not p["text"].startswith("<"))
+
+    result = {}
+    for pat_name, count in pattern_counts.most_common():
+        result[pat_name] = {
+            "label": COGNITIVE_PATTERNS[pat_name]["label"],
+            "count": count,
+            "rate": round(count / max(total_prompts, 1) * 100, 1),
+            "examples": pattern_examples[pat_name],
+        }
+    return result
 
 
-def load_cline_roo_prompts(days=None, project=None):
-    roots = [Path.home() / ".vscode/extensions"]
-    for d in VSCODE_DATA_DIRS:
-        roots.append(d / "User/globalStorage")
-    for d in CURSOR_DATA_DIRS:
-        roots.append(d / "User/globalStorage")
-    files = []
-    for root in roots:
-        if root.exists():
-            files.extend(root.rglob("ui_messages.json"))
-            files.extend(root.rglob("api_conversation_history.json"))
-    return load_json_file_prompts("cline-roo", "Cline/Roo Code", files, days, project)
-
-
-def load_gemini_prompts(days=None, project=None):
-    root = Path.home() / ".gemini"
-    files = []
-    if root.exists():
-        files.extend(root.rglob("*.json"))
-        files.extend(root.rglob("*.jsonl"))
-    return load_json_file_prompts("gemini", "Gemini CLI", files[:200], days, project)
-
-
-def load_chatgpt_export_prompts(days=None, project=None):
-    candidates = [
-        Path.home() / "Downloads/conversations.json",
-        Path.home() / "Downloads/chatgpt-export/conversations.json",
-        Path.home() / "chatgpt-export/conversations.json",
-    ]
-    candidates.extend(Path.home().glob("Downloads/**/conversations.json"))
-    return load_json_file_prompts("chatgpt-export", "ChatGPT Export", candidates[:50], days, project)
-
-
-
-def load_qoder_prompts(days=None, project=None):
-    """Load Qoder IDE conversation prompts from JSONL transcript files.
-
-    Qoder stores full plaintext transcripts at:
-      ~/.qoder/projects/<project-path>/transcript/<session-id>.jsonl
-      ~/.qoder/cache/projects/<project-hash>/conversation-history/<id>/<id>.jsonl
-    """
-    records = []
-    cutoff = cutoff_ms(days)
-    transcript_dirs = []
-
-    # Collect all transcript directories
-    if QODER_DIR.exists():
-        for d in [QODER_DIR / "projects", QODER_DIR / "cache" / "projects"]:
-            if d.exists():
-                transcript_dirs.append(d)
-
-    jsonl_files = []
-    for base in transcript_dirs:
-        jsonl_files.extend(base.rglob("*.jsonl"))
-
-    for jsonl_path in jsonl_files:
-        session_id = jsonl_path.stem
-        # Derive project name from path
-        parts = str(jsonl_path.relative_to(QODER_DIR)).split("/")
-        project_name = "unknown"
-        if len(parts) >= 2:
-            raw = parts[1]
-            # Try to extract meaningful project name from path
-            segments = raw.rsplit("-", 1)
-            if len(segments) == 2 and len(segments[1]) == 8 and all(c in '0123456789abcdef' for c in segments[1]):
-                # cache format: "projname-hash8"
-                project_name = segments[0]
-            else:
-                # projects format: "-Users-user-path-to-project" → take last meaningful segment
-                name_parts = [p for p in raw.strip("-").split("-") if p]
-                # Skip common path prefixes
-                skip = {"Users", "home", "Project", "Projects", "workspace"}
-                meaningful = [p for p in name_parts if p not in skip and len(p) > 1]
-                project_name = meaningful[-1] if meaningful else name_parts[-1] if name_parts else raw
-
-        if project and project not in project_name:
-            continue
-
-        try:
-            with open(jsonl_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    obj_type = obj.get("type", "")
-                    obj_role = obj.get("role", "")
-                    if obj_type not in ("user",) and obj_role not in ("user", "human"):
-                        continue
-
-                    msg = obj.get("message", {}) if obj_type == "user" else obj
-                    if not isinstance(msg, dict):
-                        continue
-
-                    content = msg.get("content", "")
-                    text = ""
-                    if isinstance(content, str):
-                        text = content.strip()
-                    elif isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text = (block.get("content", "") or block.get("text", "")).strip()
-                                break
-                        # If only tool_result blocks, skip
-                        if not text:
-                            continue
-
-                    if not text or len(text) < 3:
-                        continue
-                    # Skip system/tool outputs
-                    if text.startswith("Command completed") or text.startswith("Contents of /"):
-                        continue
-
-                    ts_str = obj.get("timestamp", "")
-                    ts_ms = coerce_ts_ms(ts_str)
-                    if cutoff and ts_ms and ts_ms < cutoff:
-                        continue
-
-                    records.append(make_prompt_record(
-                        "qoder", "Qoder", text, ts_ms,
-                        project_name, session_id,
-                        transcript_path=str(jsonl_path),
-                        metadata={"mode": "agent"},
-                    ))
-        except OSError:
-            continue
-
-    return records
-
-
-def load_prompts(days=None, project=None, sources=None):
-    """Load prompt index from all supported providers."""
-    selected = parse_sources(sources) if isinstance(sources, str) else sources
-    loaders = [
-        ("claude-code", load_claude_prompts),
-        ("codex", load_codex_prompts),
-        ("cursor", load_cursor_prompts),
-        ("cline-roo", load_cline_roo_prompts),
-        ("gemini", load_gemini_prompts),
-        ("chatgpt-export", load_chatgpt_export_prompts),
-        ("qoder", load_qoder_prompts),
-    ]
-    records = []
-    for source_id, loader in loaders:
-        if selected and source_id not in selected:
-            continue
-        records.extend(loader(days=days, project=project))
-    records = [r for r in records if r.get("text")]
-    records.sort(key=lambda r: r.get("timestamp_ms") or 0)
-    return records
-
-
-def find_session_file(session_id):
-    """Find the JSONL file containing this session."""
-    project_dir = CLAUDE_DIR / "projects"
-    if not project_dir.exists():
-        return None
-
-    sid_short = session_id[:8]
-    filename_matches = []
-    for jsonl_file in project_dir.rglob("*.jsonl"):
-        if "audit" in str(jsonl_file) or "history" in jsonl_file.name:
-            continue
-        if session_id in jsonl_file.name or sid_short in jsonl_file.name:
-            filename_matches.append(jsonl_file)
-    if filename_matches:
-        filename_matches.sort(key=lambda p: len(str(p)))
-        return filename_matches[0]
-
-    for jsonl_file in CLAUDE_DIR.joinpath("projects").rglob("*.jsonl"):
-        if "audit" in str(jsonl_file) or "history" in jsonl_file.name:
-            continue
-        try:
-            with open(jsonl_file) as f:
-                for line in f:
-                    if session_id in line:
-                        return jsonl_file
-        except: continue
-    return None
-
-
-def extract_context_by_turn(session_file, session_id, target_turn):
-    """
-    Layer 2: Read session JSONL and extract context around target_turn.
-    Returns {ai_before, user_complaint, ai_after}.
-    """
-    if not session_file:
-        return None
-
-    messages = []  # (type, content_summary, turn_number)
-    user_turn = 0
-
-    try:
-        with open(session_file, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    obj = json.loads(line.strip())
-                    if obj.get("sessionId") and obj.get("sessionId") != session_id:
-                        continue
-                    t = obj.get("type")
-
-                    if t == "user":
-                        user_turn += 1
-                        msg = obj.get("message", {})
-                        content = msg.get("content", "")
-                        text = ""
-                        if isinstance(content, list):
-                            for b in content:
-                                if isinstance(b, dict) and b.get("type") == "text":
-                                    text = b.get("text", "")[:300]
-                                    break
-                        elif isinstance(content, str):
-                            text = content[:300]
-                        if text.strip() and not text.startswith("<"):
-                            messages.append(("user", text.strip(), user_turn))
-
-                    elif t == "assistant":
-                        msg = obj.get("message", {})
-                        content = msg.get("content", [])
-                        summary_parts = []
-                        if isinstance(content, list):
-                            for b in content:
-                                if isinstance(b, dict):
-                                    if b.get("type") == "text":
-                                        txt = b.get("text", "")[:200]
-                                        if txt.strip():
-                                            summary_parts.append(f"said: {txt}")
-                                    elif b.get("type") == "tool_use":
-                                        name = b.get("name", "?")
-                                        inp = b.get("input", {})
-                                        if name in ("Read", "Edit", "Write"):
-                                            fp = inp.get("file_path", "?").split("/")[-1]
-                                            summary_parts.append(f"{name}({fp})")
-                                        elif name == "Bash":
-                                            cmd = str(inp.get("command", ""))[:60]
-                                            summary_parts.append(f"Bash({cmd})")
-                                        else:
-                                            summary_parts.append(name)
-                        if summary_parts:
-                            messages.append(("assistant", " → ".join(summary_parts[:3]), user_turn))
-                except: continue
-    except: return None
-
-    # Find messages around target_turn
-    target_idx = None
-    for i, (role, text, turn) in enumerate(messages):
-        if role == "user" and turn == target_turn:
-            target_idx = i
-            break
-
-    if target_idx is None:
-        return None
-
-    # Last AI message before complaint
-    ai_before = None
-    for i in range(target_idx - 1, max(target_idx - 4, -1), -1):
-        if i >= 0 and messages[i][0] == "assistant":
-            ai_before = messages[i][1][:300]
-            break
-
-    # User complaint
-    user_complaint = messages[target_idx][1][:300]
-
-    # AI response after
-    ai_after = None
-    for i in range(target_idx + 1, min(target_idx + 4, len(messages))):
-        if messages[i][0] == "assistant":
-            ai_after = messages[i][1][:300]
-            break
-
-    return {
-        "ai_before": ai_before,
-        "user_complaint": user_complaint,
-        "ai_after": ai_after,
-    }
-
+# ─── Data loading: Provider-based ─────────────────────────────
 
 # ─── Layer 1: Frustration signal scanning ─────────────────────
 
@@ -855,11 +558,22 @@ def deep_dive_incidents(signals, max_incidents=8):
                 break
 
         ctx = extract_context(s["session_id"], s["full_prompt"], radius=4, source=s.get("source_id"))
+
+        # Match against the AI-side library. Scan both the correction text and
+        # nearby user turns for better recall.
+        ctx_user_text = ""
+        if isinstance(ctx, dict):
+            for m in ctx.get("context", []) or []:
+                if m.get("role") == "user":
+                    ctx_user_text += " " + m.get("content", "")
+        matched_ap = match_antipatterns(s.get("full_prompt", ""), ctx_user_text)
+
         incidents.append({
             **s,
             "turn_in_session": turn,
             "total_turns_in_session": len(prompts_in_session),
             "context": ctx,
+            "matched_antipatterns": matched_ap,
         })
 
     return incidents
@@ -888,79 +602,7 @@ def compute_session_stats(prompts):
     }
 
 
-def _extract_model_claude(sid, metadata):
-    """Extract model from Claude Code session JSONL."""
-    tp = metadata.get("project_path", "")
-    if not tp:
-        return None
-    sid_short = sid[:8]
-    projects_dir = CLAUDE_DIR / "projects"
-    if not projects_dir.exists():
-        return None
-    for jsonl_file in projects_dir.rglob("*.jsonl"):
-        if sid_short in jsonl_file.name and "audit" not in str(jsonl_file):
-            try:
-                with open(jsonl_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            obj = json.loads(line)
-                            if obj.get("type") == "assistant":
-                                model = obj.get("message", {}).get("model", "")
-                                if model:
-                                    return model
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-            except OSError:
-                pass
-            break
-    return None
-
-
-def _extract_model_codex(sid, metadata):
-    """Extract model from Codex rollout JSONL (turn_context.payload.model)."""
-    thread_index = load_codex_thread_index()
-    path = find_codex_rollout(sid, thread_index)
-    if not path:
-        return None
-    try:
-        for obj in iter_jsonl(path):
-            if obj.get("type") == "turn_context":
-                model = obj.get("payload", {}).get("model")
-                if model:
-                    return model
-    except OSError:
-        pass
-    return None
-
-
-def _extract_model_qoder(sid, metadata):
-    """Extract model from Qoder JSONL (assistant record obj.model or obj.message.model)."""
-    for base in [QODER_DIR / "projects", QODER_DIR / "cache" / "projects"]:
-        if not base.exists():
-            continue
-        for jsonl in base.rglob("*.jsonl"):
-            if sid[:12] not in jsonl.stem:
-                continue
-            try:
-                for obj in iter_jsonl(jsonl):
-                    if obj.get("role") == "assistant" or obj.get("type") == "assistant":
-                        model = obj.get("model") or obj.get("message", {}).get("model", "")
-                        if model and model != "auto":
-                            return model
-                        if model == "auto":
-                            provider = obj.get("provider", "")
-                            return f"qoder:{provider}" if provider else "qoder:auto"
-            except OSError:
-                pass
-            return None
-    return None
-
-
-_MODEL_EXTRACTORS = {
-    "claude-code": _extract_model_claude,
-    "codex": _extract_model_codex,
-    "qoder": _extract_model_qoder,
-}
+_MODEL_SOURCES = ("claude-code", "codex", "qoder")
 
 
 def compute_model_stats(prompts, signals):
@@ -971,12 +613,12 @@ def compute_model_stats(prompts, signals):
     for p in prompts:
         sid = p.get("session_id", "")
         source_id = p.get("source_id", "")
-        if not sid or source_id not in _MODEL_EXTRACTORS:
+        if not sid or source_id not in _MODEL_SOURCES:
             continue
         if sid in session_models:
             model_prompts[session_models[sid]] += 1
             continue
-        model = _MODEL_EXTRACTORS[source_id](sid, p.get("metadata", {}))
+        model = extract_model(source_id, sid, p.get("metadata", {}))
         if model:
             session_models[sid] = model
             model_prompts[model] += 1
@@ -1086,10 +728,15 @@ def score_prompt_quality(text):
 
 
 def compute_prompt_quality_stats(prompts):
-    """Compute aggregate prompt quality statistics."""
+    """Compute how much information prompts hand the AI to act on.
+
+    This measures FORM (can the AI start without guessing?), not whether a
+    prompt is 'good'. Terse expert commands, slash commands, and casual
+    follow-ups are legitimate and are described neutrally, not scored as 'bad'.
+    """
     scores = []
-    low_quality = []
-    vague_count = 0
+    sparse = []
+    underspecified_count = 0
 
     for p in prompts:
         text = p["text"].strip()
@@ -1101,32 +748,45 @@ def compute_prompt_quality_stats(prompts):
         scores.append(score)
         if score < 40:
             missing = [k for k, v in breakdown.items() if v == 0]
-            low_quality.append({"text": text[:100], "score": score, "missing": missing,
-                                "project": p.get("project", ""), "source": p.get("source", "")})
+            sparse.append({"text": text[:100], "score": score, "missing": missing,
+                           "project": p.get("project", ""), "source": p.get("source", "")})
         if len(text) > 10 and not _FILE_REF.search(text) and not _GOAL_VERBS.search(text):
-            vague_count += 1
+            underspecified_count += 1
 
     if not scores:
         return {}
 
-    dist = {"excellent_80_100": 0, "good_60_79": 0, "fair_40_59": 0, "poor_0_39": 0}
+    # Neutral, descriptive bands — NOT value judgments. A "minimal" prompt is
+    # often perfectly fine (e.g. a terse command an expert gives on purpose).
+    dist = {"complete": 0, "adequate": 0, "sparse": 0, "minimal": 0}
     for s in scores:
         if s >= 80:
-            dist["excellent_80_100"] += 1
+            dist["complete"] += 1
         elif s >= 60:
-            dist["good_60_79"] += 1
+            dist["adequate"] += 1
         elif s >= 40:
-            dist["fair_40_59"] += 1
+            dist["sparse"] += 1
         else:
-            dist["poor_0_39"] += 1
+            dist["minimal"] += 1
 
-    low_quality.sort(key=lambda x: x["score"])
+    sparse.sort(key=lambda x: x["score"])
     return {
+        "metric_name": {"zh": "信息完整度", "en": "Information completeness"},
+        "note": {
+            "zh": "衡量 prompt 是否给了 AI 足够信息直接开工（形式层面），不是判断 prompt 好坏。简短指令、斜杠命令、口语化追问本身没问题，不要当成缺点。",
+            "en": "Measures whether a prompt gives the AI enough to start without guessing (a form signal), NOT whether the prompt is 'good'. Terse commands, slash commands and casual follow-ups are legitimate — do not treat them as flaws."
+        },
         "avg_score": round(sum(scores) / len(scores), 1),
         "total_scored": len(scores),
+        "band_labels": {
+            "complete": {"zh": "信息充分", "en": "Complete"},
+            "adequate": {"zh": "基本够用", "en": "Adequate"},
+            "sparse": {"zh": "偏简", "en": "Sparse"},
+            "minimal": {"zh": "极简", "en": "Minimal"},
+        },
         "score_distribution": dist,
-        "vagueness_rate": round(vague_count / max(len(scores), 1) * 100, 1),
-        "top_low_quality": low_quality[:5],
+        "underspecified_rate": round(underspecified_count / max(len(scores), 1) * 100, 1),
+        "top_sparse": sparse[:5],
     }
 
 
@@ -1183,11 +843,27 @@ def compute_efficiency_stats(prompts):
 # ─── Task type & collaboration style classification ──────────────
 
 _TASK_TYPE_PATTERNS = [
-    ("coding", re.compile(r"写代码|实现|开发|function|method|class|interface|import|def |编码|新增.*方法|enum|DTO|Service|Controller|API")),
-    ("debugging", re.compile(r"bug|error|报错|异常|不工作|fix|debug|trace|排查|问题|崩溃|失败|卡住|不生效|不好使")),
-    ("research", re.compile(r"搜索|调[查研]|查一下|对比|评估|怎么做|是什么|分析|全网检索|了解一下|调研|选型")),
-    ("writing", re.compile(r"写文[章档]|文档|总结|报告|博客|README|系分|沉淀|记录|公众号|PPT|汇报")),
-    ("configuration", re.compile(r"配置|安装|部署|环境|hook|settings|config|setup|install|deploy|发布|上线")),
+    ("coding", re.compile(
+        r"写代码|实现|开发|编码|重构|refactor|封装|抽象|加(个|一个|上)|改成|改为"
+        r"|新增|删除|优化.*(代码|逻辑|性能)|字段|参数|函数|方法|类|模块|组件|接口"
+        r"|前端|后端|页面|样式|sql|查询|脚本|迁移|集成|对接|引入|依赖"
+        r"|function|method|class|interface|import|def |enum|DTO|Service|Controller|API")),
+    ("debugging", re.compile(
+        r"bug|error|报错|异常|不工作|fix|debug|trace|排查|崩溃|失败|卡住|卡死"
+        r"|不生效|不好使|定位|复现|日志|log|stack|堆栈|为什么|为啥|怎么回事"
+        r"|不对劲|没生效|超时|null|空指针|挂了|跑不[起通]|修复|修一下")),
+    ("design", re.compile(
+        r"方案|架构|系分|系统设计|设计一?[个下]|技术选型|链路梳理|拆解|评审"
+        r"|怎么设计|如何设计|建模|edesign|流程图|时序图")),
+    ("research", re.compile(
+        r"搜索|调[查研]|查一下|对比|评估|怎么做|是什么|全网检索|了解一下|调研|选型"
+        r"|有没有|能不能|可不可以|可行|推荐|建议|区别|优缺点|原理|机制|研究|找找")),
+    ("writing", re.compile(
+        r"写文[章档]|文档|总结|报告|博客|README|沉淀|记录|公众号|PPT|汇报"
+        r"|文案|讲解|介绍|说明|润色|翻译|大纲|摘要")),
+    ("configuration", re.compile(
+        r"配置|安装|部署|环境|hook|settings|config|setup|install|deploy|发布|上线"
+        r"|权限|账号|密钥|token|证书|依赖版本|升级.*版本")),
 ]
 
 
@@ -1215,18 +891,28 @@ def classify_collab_style(text):
 
 
 def compute_classification_stats(prompts):
-    """Compute task type and collaboration style distributions."""
+    """Compute task type and collaboration style distributions.
+
+    Placeholder prompts (pasted text / images) carry no analyzable text, so they
+    are excluded from the task-type denominator and reported separately rather
+    than inflating an "other" bucket that looks like classification failure.
+    """
     task_dist = Counter()
     style_dist = Counter()
+    unclassifiable = 0
     for p in prompts:
         text = p["text"].strip()
         if not text or text.startswith("/") or text.startswith("<") or len(text) <= 2:
+            continue
+        if text.startswith("[Pasted") or text.startswith("[Image") or text.startswith("[图"):
+            unclassifiable += 1
             continue
         task_dist[classify_task_type(text)] += 1
         style_dist[classify_collab_style(text)] += 1
     return {
         "task_type": dict(task_dist.most_common()),
         "collab_style": dict(style_dist.most_common()),
+        "unclassifiable_pasted": unclassifiable,
     }
 
 
@@ -1294,118 +980,6 @@ def detect_session_antipatterns(prompts):
     }
 
 
-def discover_sources():
-    """Discover available data sources."""
-    sources = {}
-
-    h = CLAUDE_DIR / "history.jsonl"
-    if h.exists():
-        with open(h) as f:
-            prompt_count = sum(1 for _ in f)
-        transcript_count = len(glob.glob(str(CLAUDE_DIR / "projects/**/*.jsonl"), recursive=True))
-        sources["Claude Code"] = {
-            "source_id": "claude-code",
-            "status": "full",
-            "prompt_index": str(h),
-            "prompt_count": prompt_count,
-            "transcript_count": transcript_count,
-            "context": "full_transcript",
-        }
-
-    ch = CODEX_DIR / "history.jsonl"
-    if ch.exists():
-        with open(ch) as f:
-            prompt_count = sum(1 for _ in f)
-        transcript_count = (
-            len(glob.glob(str(CODEX_DIR / "sessions/**/*.jsonl"), recursive=True)) +
-            len(glob.glob(str(CODEX_DIR / "archived_sessions/*.jsonl")))
-        )
-        sources["Codex"] = {
-            "source_id": "codex",
-            "status": "full" if transcript_count else "prompt_index",
-            "prompt_index": str(ch),
-            "prompt_count": prompt_count,
-            "transcript_count": transcript_count,
-            "context": "full_transcript_when_rollout_exists",
-        }
-
-    cursor_dbs = []
-    for d in CURSOR_DATA_DIRS:
-        cursor_dbs.extend(glob.glob(str(d / "User/**/state.vscdb"), recursive=True))
-    if cursor_dbs or (Path.home() / ".cursor").exists():
-        sources["Cursor"] = {
-            "source_id": "cursor",
-            "status": "best_effort" if cursor_dbs else "detected_metadata_only",
-            "db_count": len(cursor_dbs),
-            "context": "sqlite_schema_varies",
-        }
-
-    cline_files = []
-    cline_roots = [Path.home() / ".vscode/extensions"]
-    for d in VSCODE_DATA_DIRS:
-        cline_roots.append(d / "User/globalStorage")
-    for d in CURSOR_DATA_DIRS:
-        cline_roots.append(d / "User/globalStorage")
-    for root in cline_roots:
-        if root.exists():
-            cline_files.extend(root.rglob("ui_messages.json"))
-            cline_files.extend(root.rglob("api_conversation_history.json"))
-    if cline_files or glob.glob(str(Path.home() / ".vscode/extensions/*cline*")):
-        sources["Cline/Roo Code"] = {
-            "source_id": "cline-roo",
-            "status": "best_effort" if cline_files else "detected_no_history",
-            "history_file_count": len(cline_files),
-            "context": "json_history",
-        }
-
-    if (Path.home() / ".gemini").exists():
-        sources["Gemini CLI"] = {
-            "source_id": "gemini",
-            "status": "best_effort",
-            "context": "json_history_if_present",
-        }
-
-    chatgpt_exports = list(Path.home().glob("Downloads/conversations.json")) + \
-                      list(Path.home().glob("Downloads/chatgpt-export/conversations.json"))
-    if chatgpt_exports:
-        sources["ChatGPT Export"] = {
-            "source_id": "chatgpt-export",
-            "status": "best_effort",
-            "file_count": len(chatgpt_exports),
-            "context": "export_file",
-        }
-
-    qoder_transcripts = []
-    for base in [QODER_DIR / "projects", QODER_DIR / "cache" / "projects"]:
-        if base.exists():
-            qoder_transcripts.extend(base.rglob("*.jsonl"))
-    qoder_app_found = any(d.exists() for d in QODER_APP_DIRS)
-    if qoder_transcripts or qoder_app_found:
-        sources["Qoder"] = {
-            "source_id": "qoder",
-            "status": "full" if qoder_transcripts else "detected_app_only",
-            "transcript_count": len(qoder_transcripts),
-            "context": "full_transcript" if qoder_transcripts else "no_transcripts_found",
-        }
-
-    for path, label in [
-        (Path.home() / ".continue", "Continue"),
-        (Path.home() / ".aider.chat.history.md", "Aider"),
-        (Path.home() / ".local/share/opencode", "OpenCode"),
-    ]:
-        if path.exists():
-            sources[label] = {
-                "source_id": label.lower().replace(" ", "-"),
-                "status": "detected_provider_todo",
-                "path": str(path),
-                "context": "detected_not_parsed_yet",
-            }
-
-    return sources
-
-
-# ─── Main flow ────────────────────────────────────────────────
-
 def analyze(days=None, project=None, deep=True, sources=None):
     prompts = load_prompts(days=days, project=project, sources=sources)
     if not prompts:
@@ -1419,6 +993,20 @@ def analyze(days=None, project=None, deep=True, sources=None):
     if deep and signals:
         incidents = deep_dive_incidents(signals, max_incidents=6)
 
+    # Anti-pattern library coverage across ALL frustration signals (not just the
+    # deep-dived sample). Groups incidents by known root cause across sessions
+    # and projects, and carries the curated fix_rule for each.
+    antipattern_library = scan_antipattern_matches(signals)
+    # Coarse recurring-theme view by category, covering signals that don't match
+    # a known pattern — surfaces what keeps recurring across projects and time.
+    recurring_categories = compute_recurring_categories(signals)
+
+    # Positive signals
+    positive_signals, positive_counts = scan_positive_signals(prompts)
+
+    # Cognitive patterns
+    cognitive_patterns = detect_cognitive_patterns(prompts)
+
     # Helper stats
     session_stats = compute_session_stats(prompts)
     model_stats = compute_model_stats(prompts, signals)
@@ -1427,6 +1015,14 @@ def analyze(days=None, project=None, deep=True, sources=None):
     efficiency = compute_efficiency_stats(prompts)
     classifications = compute_classification_stats(prompts)
     antipatterns = detect_session_antipatterns(prompts)
+
+    # Deterministic, session-level health so the headline number is stable across
+    # runs (not re-derived by the LLM each time). Health = share of sessions with
+    # no correction. Session-level, not per-prompt, so long sessions don't dilute.
+    frustrated_sessions = {(s.get("source_id"), s.get("session_id"))
+                           for s in signals if s.get("session_id")}
+    _total_sess = session_stats["total_sessions"]
+    health_score = round(100 - len(frustrated_sessions) / max(_total_sess, 1) * 100)
 
     # Per-project stats: total prompts + frustration count + rate
     project_prompts = Counter(p["project"] for p in prompts)
@@ -1451,6 +1047,12 @@ def analyze(days=None, project=None, deep=True, sources=None):
         "overview": {
             "total_prompts": len(prompts),
             "total_sessions": session_stats["total_sessions"],
+            "health_score": health_score,
+            "health_basis": {
+                "zh": "健康度 = 无纠正的 session 占比（会话级，确定性）",
+                "en": "Health = share of sessions with zero corrections (session-level, deterministic)",
+            },
+            "frustrated_session_count": len(frustrated_sessions),
             "data_sources": discover_sources(),
             "source_prompt_counts": dict(Counter(p.get("source", "unknown") for p in prompts)),
         },
@@ -1476,16 +1078,31 @@ def analyze(days=None, project=None, deep=True, sources=None):
                 "turn": inc.get("turn_in_session"),
                 "total_turns": inc.get("total_turns_in_session"),
                 "context": inc.get("context"),
+                "matched_antipatterns": inc.get("matched_antipatterns", []),
             }
             for inc in incidents
         ],
+        "antipattern_library": antipattern_library,
+        "recurring_categories": recurring_categories,
         "session_stats": session_stats,
         "high_frequency_phrases": high_freq,
         "prompt_quality": prompt_quality,
         "efficiency": efficiency,
         "task_type_distribution": classifications.get("task_type", {}),
         "collab_style_distribution": classifications.get("collab_style", {}),
+        "unclassifiable_pasted": classifications.get("unclassifiable_pasted", 0),
         "session_antipatterns": antipatterns,
+        "positive_signals": {
+            "total": len(positive_signals),
+            "category_counts": positive_counts,
+            "category_labels": {k: v["label"] for k, v in POSITIVE_CATEGORIES.items()},
+            "signals_sample": [
+                {"category": s["category"], "prompt": s["full_prompt"][:150],
+                 "source": s.get("source"), "project": s["project"]}
+                for s in positive_signals[:20]
+            ],
+        },
+        "cognitive_patterns": cognitive_patterns,
     }
 
 
@@ -1513,358 +1130,6 @@ def scope_check():
             ", too few — expand to 180d" if recommended == 180 else
             ", good volume"
         ),
-    }
-
-
-def extract_claude_context(session_id, target_prompt_text, radius=4):
-    """
-    Stage 2: Read ±radius turns of full conversation context around an incident.
-    Returns structured context snippet.
-    """
-    claude_dir = CLAUDE_DIR / "projects"
-
-    # Use grep to quickly locate file
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["grep", "-rl", session_id, str(claude_dir)],
-            capture_output=True, text=True, timeout=15
-        )
-        files = [f for f in result.stdout.strip().split("\n")
-                 if f.strip() and "audit" not in f and "history" not in f
-                 and "agent-" not in f.split("/")[-1]]
-    except:
-        files = []
-
-    if not files:
-        return {"error": "session_file_not_found", "session_id": session_id}
-
-    # Prefer files whose name contains the session ID
-    sid_short = session_id[:8]
-    files.sort(key=lambda f: (0 if sid_short in f.split("/")[-1] else 1))
-
-    # Parse conversation
-    msgs = []
-    for filepath in files[:1]:
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        obj = json.loads(line)
-                        obj_sid = obj.get("sessionId", "")
-                        if obj_sid and not session_id.startswith(obj_sid) and not obj_sid.startswith(session_id[:20]):
-                            continue
-                        t = obj.get("type")
-
-                        if t == "user":
-                            msg = obj.get("message", {})
-                            c = msg.get("content", "")
-                            text = ""
-                            if isinstance(c, list):
-                                for b in c:
-                                    if isinstance(b, dict) and b.get("type") == "text":
-                                        text = b.get("text", "")[:500]
-                                        break
-                            elif isinstance(c, str):
-                                text = c[:500]
-                            text = text.strip()
-                            if text and not text.startswith("<local-command") and not text.startswith("<command-name"):
-                                msgs.append({"role": "user", "content": text})
-
-                        elif t == "assistant":
-                            msg = obj.get("message", {})
-                            content = msg.get("content", [])
-                            text_parts = []
-                            tool_parts = []
-                            if isinstance(content, list):
-                                for b in content:
-                                    if isinstance(b, dict):
-                                        if b.get("type") == "text":
-                                            txt = b.get("text", "")[:300]
-                                            if txt.strip():
-                                                text_parts.append(txt.strip())
-                                        elif b.get("type") == "tool_use":
-                                            n = b.get("name", "?")
-                                            inp = b.get("input", {})
-                                            if n in ("Read", "Edit", "Write"):
-                                                fp = str(inp.get("file_path", "")).split("/")[-1]
-                                                tool_parts.append(f"{n}({fp})")
-                                            elif n == "Bash":
-                                                tool_parts.append(f"Bash({str(inp.get('command',''))[:40]})")
-                                            else:
-                                                tool_parts.append(n)
-                            summary = ""
-                            if text_parts:
-                                summary = text_parts[0][:300]
-                            if tool_parts:
-                                summary += (" | " if summary else "") + " → ".join(tool_parts[:4])
-                            if summary:
-                                msgs.append({"role": "assistant", "content": summary})
-                    except:
-                        continue
-        except:
-            continue
-
-    if not msgs:
-        return {"error": "no_messages_parsed", "session_id": session_id}
-
-    # Find target prompt
-    target_idx = None
-    target_short = target_prompt_text[:40]
-    for i, m in enumerate(msgs):
-        if m["role"] == "user" and target_short in m["content"]:
-            target_idx = i
-            break
-
-    if target_idx is None:
-        # fallback: find closest match
-        import difflib
-        best_ratio = 0
-        for i, m in enumerate(msgs):
-            if m["role"] == "user":
-                ratio = difflib.SequenceMatcher(None, target_short, m["content"][:40]).ratio()
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    target_idx = i
-
-    if target_idx is None:
-        return {"error": "target_not_found", "session_id": session_id}
-
-    # Extract context
-    start = max(0, target_idx - radius)
-    end = min(len(msgs), target_idx + radius + 1)
-
-    context_msgs = []
-    for i in range(start, end):
-        m = msgs[i]
-        context_msgs.append({
-            "role": m["role"],
-            "content": m["content"],
-            "is_target": i == target_idx,
-            "position": i - target_idx,  # -4 ~ +4
-        })
-
-    return {
-        "session_id": session_id,
-        "source_id": "claude-code",
-        "total_messages": len(msgs),
-        "target_index": target_idx,
-        "context_radius": radius,
-        "context": context_msgs,
-    }
-
-
-def extract_codex_context(session_id, target_prompt_text, radius=4):
-    thread_index = load_codex_thread_index()
-    path = find_codex_rollout(session_id, thread_index)
-    msgs = []
-
-    if path:
-        for obj in iter_jsonl(path):
-            t = obj.get("type")
-            payload = obj.get("payload", {})
-            if t == "event_msg" and payload.get("type") == "user_message":
-                text = payload.get("message", "")
-                if text:
-                    msgs.append({"role": "user", "content": text[:500]})
-                continue
-            if t != "response_item":
-                continue
-            if payload.get("type") != "message":
-                continue
-            role = payload.get("role")
-            if role not in ("user", "assistant"):
-                continue
-            text = text_from_blocks(payload.get("content", []))
-            if text and not text.startswith("# AGENTS.md instructions"):
-                msgs.append({"role": role, "content": text[:500]})
-
-    if not msgs:
-        # fallback: Codex history has user prompts only
-        history = CODEX_DIR / "history.jsonl"
-        for obj in iter_jsonl(history):
-            if obj.get("session_id") == session_id:
-                text = obj.get("text", "")
-                if text:
-                    msgs.append({"role": "user", "content": text[:500]})
-
-    if not msgs:
-        return {"error": "codex_context_not_found", "session_id": session_id, "source_id": "codex"}
-
-    target_idx = None
-    target_short = target_prompt_text[:40]
-    for i, m in enumerate(msgs):
-        if m["role"] == "user" and target_short in m["content"]:
-            target_idx = i
-            break
-
-    if target_idx is None:
-        import difflib
-        best_ratio = 0
-        for i, m in enumerate(msgs):
-            if m["role"] != "user":
-                continue
-            ratio = difflib.SequenceMatcher(None, target_short, m["content"][:40]).ratio()
-            if ratio > best_ratio:
-                best_ratio = ratio
-                target_idx = i
-
-    if target_idx is None:
-        return {"error": "target_not_found", "session_id": session_id, "source_id": "codex"}
-
-    start = max(0, target_idx - radius)
-    end = min(len(msgs), target_idx + radius + 1)
-    return {
-        "session_id": session_id,
-        "source_id": "codex",
-        "transcript_path": path,
-        "total_messages": len(msgs),
-        "target_index": target_idx,
-        "context_radius": radius,
-        "context": [
-            {**msgs[i], "is_target": i == target_idx, "position": i - target_idx}
-            for i in range(start, end)
-        ],
-    }
-
-
-def extract_qoder_context(session_id, target_prompt_text, radius=4):
-    """Extract conversation context from Qoder JSONL transcripts."""
-    # Find the transcript file by session_id
-    transcript_file = None
-    for base in [QODER_DIR / "projects", QODER_DIR / "cache" / "projects"]:
-        if not base.exists():
-            continue
-        for jsonl in base.rglob("*.jsonl"):
-            if session_id in jsonl.stem:
-                transcript_file = jsonl
-                break
-        if transcript_file:
-            break
-
-    if not transcript_file:
-        return {"error": "qoder_transcript_not_found", "session_id": session_id, "source_id": "qoder"}
-
-    msgs = []
-    try:
-        with open(transcript_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                t = obj.get("type", "")
-                msg = obj.get("message", {})
-                if not isinstance(msg, dict):
-                    continue
-
-                if t == "user":
-                    content = msg.get("content", "")
-                    text = ""
-                    if isinstance(content, str):
-                        text = content.strip()
-                    elif isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text = (block.get("content", "") or block.get("text", "")).strip()
-                                break
-                    if text and len(text) > 2 and not text.startswith("Command completed") and not text.startswith("Contents of /"):
-                        msgs.append({"role": "user", "content": text[:500]})
-
-                elif t == "assistant":
-                    content = msg.get("content", [])
-                    summary_parts = []
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict):
-                                if block.get("type") == "text":
-                                    txt = (block.get("text", "") or block.get("content", ""))[:300]
-                                    if txt.strip():
-                                        summary_parts.append(txt)
-                                elif block.get("type") == "tool_use":
-                                    name = block.get("name", "?")
-                                    inp = block.get("input", {})
-                                    if name in ("read_file", "Read", "Edit", "Write", "SearchReplace"):
-                                        fp = str(inp.get("file_path", "?")).split("/")[-1]
-                                        summary_parts.append(f"{name}({fp})")
-                                    elif name in ("Bash", "run_in_terminal"):
-                                        cmd = str(inp.get("command", ""))[:60]
-                                        summary_parts.append(f"Bash({cmd})")
-                                    else:
-                                        summary_parts.append(name)
-                    elif isinstance(content, str) and content.strip():
-                        summary_parts.append(content[:300])
-                    if summary_parts:
-                        msgs.append({"role": "assistant", "content": " | ".join(summary_parts[:3])})
-    except OSError:
-        return {"error": "qoder_transcript_read_error", "session_id": session_id, "source_id": "qoder"}
-
-    if not msgs:
-        return {"error": "qoder_context_empty", "session_id": session_id, "source_id": "qoder"}
-
-    # Find target message
-    target_idx = None
-    target_short = target_prompt_text[:40]
-    for i, m in enumerate(msgs):
-        if m["role"] == "user" and target_short in m["content"]:
-            target_idx = i
-            break
-
-    if target_idx is None:
-        import difflib
-        best_ratio = 0
-        for i, m in enumerate(msgs):
-            if m["role"] != "user":
-                continue
-            ratio = difflib.SequenceMatcher(None, target_short, m["content"][:40]).ratio()
-            if ratio > best_ratio:
-                best_ratio = ratio
-                target_idx = i
-
-    if target_idx is None:
-        return {"error": "target_not_found", "session_id": session_id, "source_id": "qoder"}
-
-    start = max(0, target_idx - radius)
-    end = min(len(msgs), target_idx + radius + 1)
-    return {
-        "session_id": session_id,
-        "source_id": "qoder",
-        "transcript_path": str(transcript_file),
-        "total_messages": len(msgs),
-        "target_index": target_idx,
-        "context_radius": radius,
-        "context": [
-            {**msgs[i], "is_target": i == target_idx, "position": i - target_idx}
-            for i in range(start, end)
-        ],
-    }
-
-
-def extract_context(session_id, target_prompt_text, radius=4, source=None):
-    source = (source or "").lower()
-    if source in ("", "claude-code", "claude"):
-        ctx = extract_claude_context(session_id, target_prompt_text, radius)
-        if source in ("", "claude-code", "claude") and not ctx.get("error"):
-            return ctx
-        if source:
-            return ctx
-    if source in ("", "codex"):
-        ctx = extract_codex_context(session_id, target_prompt_text, radius)
-        if source == "codex" or not ctx.get("error"):
-            return ctx
-    if source in ("", "qoder"):
-        ctx = extract_qoder_context(session_id, target_prompt_text, radius)
-        if source == "qoder" or not ctx.get("error"):
-            return ctx
-    return {
-        "error": "context_not_supported_for_source",
-        "source_id": source or "unknown",
-        "session_id": session_id,
-        "note": "This provider currently supports prompt index/signal scanning only, no stable full transcript parsing yet.",
     }
 
 
@@ -1913,6 +1178,9 @@ def main():
                         "project": real[0]["project"],
                     })
 
+        pos_signals, pos_counts = scan_positive_signals(prompts)
+        cog_patterns = detect_cognitive_patterns(prompts)
+
         pq = compute_prompt_quality_stats(prompts)
         eff = compute_efficiency_stats(prompts)
         cls = compute_classification_stats(prompts)
@@ -1925,12 +1193,20 @@ def main():
                              "source": s.get("source"), "project": s["project"],
                              "session_id": s["session_id"]}
                             for s in signals]},
+            "positive": {"total": len(pos_signals), "categories": pos_counts,
+                "category_labels": {k: v["label"] for k, v in POSITIVE_CATEGORIES.items()},
+                "signals": [{"cat": s["category"], "text": s["full_prompt"][:200],
+                             "source": s.get("source"), "project": s["project"],
+                             "session_id": s["session_id"]}
+                            for s in pos_signals[:20]]},
+            "cognitive_patterns": cog_patterns,
             "success": {"total": len(quick_wins),
                 "sessions": quick_wins[:10]},
             "prompt_quality_summary": {
+                "metric_name": pq.get("metric_name"),
                 "avg_score": pq.get("avg_score"),
                 "distribution": pq.get("score_distribution"),
-                "vagueness_rate": pq.get("vagueness_rate"),
+                "underspecified_rate": pq.get("underspecified_rate"),
             } if pq else None,
             "task_type_distribution": cls.get("task_type", {}),
             "collab_style_distribution": cls.get("collab_style", {}),

@@ -111,16 +111,17 @@ Here's output from a real full-history analysis (project names anonymized):
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│  ──── Prompt Quality (5-dimension model, max 100) ────────────────────── │
+│  ──── Prompt Information Completeness (form, max 100) ─────────────────── │
 │                                                                           │
 │   Average: 40.8/100                                                       │
 │                                                                           │
-│   Excellent (80-100) ██████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░  161   11%   │
-│   Good (60-79)       █████████████░░░░░░░░░░░░░░░░░░░░░░░░░░  214   14%   │
-│   Fair (40-59)       █████████████████████████████████░░░░░░░  521   34%   │
-│   Poor (0-39)        ███████████████████████████████████████░  629   41%   │
+│   Complete (80-100) ██████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  161   11%   │
+│   Adequate (60-79)  █████████████░░░░░░░░░░░░░░░░░░░░░░░░░░  214   14%   │
+│   Sparse (40-59)    █████████████████████████████████░░░░░░  521   34%   │
+│   Minimal (0-39)    ███████████████████████████████████████  629   41%   │
 │                                                                           │
-│   Vagueness rate: 30.3% (>10 chars but no file ref and no goal verb)      │
+│   ⚠ Measures how much info a prompt gives, NOT quality — minimal ≠ bad.   │
+│   Underspecified rate: 30.3% (>10 chars, no file ref, no goal verb)       │
 │                                                                           │
 │  ──── Efficiency ──────────────────────────────────────────────────────── │
 │   First-shot success   57.4%   Sessions with ≤3 turns and no negation    │
@@ -310,7 +311,13 @@ ai-interaction-analyzer/
 │   ├── analyzer.py                   # Main analysis engine
 │   ├── mini_analyzer.py              # Lightweight session hook
 │   ├── setup.sh                      # One-command installer
-│   └── providers/                    # Modular provider refactor (WIP)
+│   └── providers/                    # One module per AI tool
+│       ├── base.py                   #   Shared helpers (record builder / JSONL / SQLite / timestamps)
+│       ├── claude_code.py            #   Claude Code (history + full transcript)
+│       ├── codex.py                  #   Codex (history + rollout transcript)
+│       ├── qoder.py                  #   Qoder (JSONL transcript)
+│       ├── cursor.py                 #   Cursor (SQLite, best-effort)
+│       └── README.md                 #   How to add a new provider
 ├── config/
 │   └── custom_patterns.example.json  # Configuration template
 ├── references/                       # Anti-patterns (user + AI side) / metrics / quality model

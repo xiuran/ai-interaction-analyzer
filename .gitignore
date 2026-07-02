@@ -23,3 +23,6 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Serena / agent tooling
+.serena/

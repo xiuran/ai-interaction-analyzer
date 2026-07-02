@@ -12,9 +12,7 @@ Adding a new provider:
   3. Add it to PROVIDER_REGISTRY below
 """
 
-from pathlib import Path
-
-from . import claude_code, codex, cursor, cline_roo, gemini, chatgpt, qoder
+from . import claude_code, codex, cursor, qoder
 from .base import parse_sources
 
 # ─── Provider Registry ────────────────────────────────────────
@@ -25,9 +23,6 @@ PROVIDER_REGISTRY = [
     ("claude-code", claude_code),
     ("codex", codex),
     ("cursor", cursor),
-    ("cline-roo", cline_roo),
-    ("gemini", gemini),
-    ("chatgpt-export", chatgpt),
     ("qoder", qoder),
 ]
 
@@ -58,30 +53,9 @@ def discover_sources():
                 "claude-code": "Claude Code",
                 "codex": "Codex",
                 "cursor": "Cursor",
-                "cline-roo": "Cline/Roo Code",
-                "gemini": "Gemini CLI",
-                "chatgpt-export": "ChatGPT Export",
                 "qoder": "Qoder",
             }
             sources[display_names.get(source_id, name)] = info
-
-    # Also detect tools we know about but can't parse yet
-    detected_paths = [
-        (Path.home() / ".config/github-copilot", "GitHub Copilot", "copilot", "no_stable_local_chat_parser"),
-        (Path.home() / ".continue", "Continue", "continue", "detected_not_parsed_yet"),
-        (Path.home() / ".aider.chat.history.md", "Aider", "aider", "detected_not_parsed_yet"),
-        (Path.home() / ".local/share/opencode", "OpenCode", "opencode", "detected_not_parsed_yet"),
-        (Path.home() / "Library/Application Support/Windsurf", "Windsurf", "windsurf", "detected_not_parsed_yet"),
-        (Path.home() / "Library/Application Support/Claude", "Claude Desktop", "claude-desktop", "detected_not_parsed_yet"),
-    ]
-    for path, label, sid, context in detected_paths:
-        if path.exists() and label not in sources:
-            sources[label] = {
-                "source_id": sid,
-                "status": "detected_config_only" if context == "no_stable_local_chat_parser" else "detected_provider_todo",
-                "path": str(path),
-                "context": context,
-            }
 
     return sources
 
@@ -90,7 +64,6 @@ def extract_context(session_id, target_prompt_text, radius=4, source=None):
     """Extract conversation context around a target prompt. Tries providers in order."""
     source = (source or "").lower()
 
-    # Try Claude Code
     if source in ("", "claude-code", "claude"):
         ctx = claude_code.extract_context(session_id, target_prompt_text, radius)
         if source in ("", "claude-code", "claude") and not ctx.get("error"):
@@ -98,10 +71,14 @@ def extract_context(session_id, target_prompt_text, radius=4, source=None):
         if source:
             return ctx
 
-    # Try Codex
     if source in ("", "codex"):
         ctx = codex.extract_context(session_id, target_prompt_text, radius)
         if source == "codex" or not ctx.get("error"):
+            return ctx
+
+    if source in ("", "qoder"):
+        ctx = qoder.extract_context(session_id, target_prompt_text, radius)
+        if source == "qoder" or not ctx.get("error"):
             return ctx
 
     return {
@@ -110,3 +87,24 @@ def extract_context(session_id, target_prompt_text, radius=4, source=None):
         "session_id": session_id,
         "note": "This provider currently supports prompt index/signal scanning only, no stable full transcript parsing yet.",
     }
+
+
+# ─── Per-source model extraction ──────────────────────────────
+# Providers that can recover which model produced a session expose extract_model.
+
+_MODEL_EXTRACTORS = {
+    "claude-code": claude_code.extract_model,
+    "codex": codex.extract_model,
+    "qoder": qoder.extract_model,
+}
+
+
+def extract_model(source_id, session_id, metadata):
+    """Return the model for a session via the owning provider, or None."""
+    fn = _MODEL_EXTRACTORS.get(source_id)
+    if not fn:
+        return None
+    try:
+        return fn(session_id, metadata)
+    except Exception:
+        return None

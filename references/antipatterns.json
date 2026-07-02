@@ -1,0 +1,151 @@
+{
+  "_meta": {
+    "purpose": "Machine-readable library of recurring AI-side failure patterns. The analyzer matches each incident's user-correction text against these patterns and attaches the curated root_cause and fix_rule on a hit.",
+    "how_matching_works": "For each frustration incident, the analyzer runs every pattern's `detection` regex against the user's correction text. A match attaches that pattern's root_cause and fix_rule to the incident. Unmatched incidents fall back to LLM-derived analysis.",
+    "how_to_extend": "Add an entry to `ai_side`. Keep `detection` focused on how a USER phrases the complaint. Keep `fix_rule` concrete but tech-stack-agnostic so any developer benefits. Bilingual (zh/en) required.",
+    "companion_doc": "反模式库.md (human-readable narrative version)"
+  },
+  "version": 1,
+  "ai_side": [
+    {
+      "id": "ai_fabricate_api",
+      "label": {
+        "zh": "信息不足时编造 API / 字段名",
+        "en": "Fabricating APIs / field names when uncertain"
+      },
+      "detection": "编译报错|方法不存在|这个\\s*API\\s*不对|字段.{0,6}哪(来|里来)|文档.{0,6}(没有|根本没|查不到)|不要(猜|瞎猜|编)|凭空|瞎编.{0,6}(方法|字段|接口|api)|method.{0,10}(doesn'?t exist|not found)|made.?up|don'?t (guess|make.?up)",
+      "root_cause": {
+        "zh": "AI 在信息不足时默认「补全」而非「暴露缺口」——对「不确定」有偏见，倾向给一个听起来合理的答案。",
+        "en": "When information is missing the AI defaults to filling the gap rather than surfacing it — it is biased against admitting uncertainty."
+      },
+      "fix_rule": {
+        "zh": "调用不熟悉的 API / 引用不确定的字段前，必须先读源码或文档确认签名与返回值，禁止凭记忆写。编造一次的修复成本是直接查的数倍。",
+        "en": "Before calling an unfamiliar API or referencing an uncertain field, read the source or docs to confirm the signature and return type. Never write from memory — fixing one fabrication costs several times more than looking it up once."
+      },
+      "scenario": {
+        "zh": "业务代码编写、线上排查、调用二方/三方包",
+        "en": "Writing business code, incident triage, calling internal/third-party libraries"
+      }
+    },
+    {
+      "id": "ai_shallow_reuse",
+      "label": {
+        "zh": "只看方法签名不读方法体，照搬模板",
+        "en": "Copying a template from signatures without reading the body"
+      },
+      "detection": "深度理解|无脑抄|照猫画虎|照搬|只看.{0,6}(签名|行号)|(读|看).{0,4}方法体了吗|真的读(了|过)吗|你理解.{0,6}(逻辑|代码)吗|copy.?paste|did you (actually )?read|blindly",
+      "root_cause": {
+        "zh": "AI 倾向用最小上下文完成任务，但代码改动需要理解「为什么这么写」而不只是「写了什么」，在新旧差异点上踩坑。",
+        "en": "The AI tries to finish with minimal context, but code changes require understanding why something is written a certain way, not just what it says — so it trips on the differences between old and new."
+      },
+      "fix_rule": {
+        "zh": "参照旧实现做新功能时，必须读旧实现的完整逻辑，列出新旧场景的差异点，再针对性改动——不能只看签名/变更清单就套用。",
+        "en": "When basing new work on an existing implementation, read its full logic, list where the new case differs from the old, then adapt deliberately — never copy from signatures or a changelog alone."
+      },
+      "scenario": {
+        "zh": "参照旧代码做新功能、系分设计、跨模块复用",
+        "en": "Building on existing code, design docs, cross-module reuse"
+      }
+    },
+    {
+      "id": "ai_fabricate_diagnosis",
+      "label": {
+        "zh": "排查时用片段信息编造因果链",
+        "en": "Inventing a causal chain from partial evidence during triage"
+      },
+      "detection": "不要瞎编|你分析的对吗|需要我提供|可以叫我提供|证据呢|真的是这个原因|凭.{0,4}(猜|印象)|你确定.{0,6}(原因|是它)|prove it|are you sure.{0,15}(cause|reason)|jumping to conclusions",
+      "root_cause": {
+        "zh": "手里只有片段信息就急于给确定性结论，把「听起来合理」当成「已验证」，编造因果关系。",
+        "en": "With only fragments in hand the AI rushes to a definitive conclusion, treating 'sounds plausible' as 'verified' and inventing causality."
+      },
+      "fix_rule": {
+        "zh": "排查问题时先分两栏列「已确认事实」和「还需要的信息」。信息不足时禁止给确定性结论，主动说明缺什么、可以问谁要。",
+        "en": "When triaging, first split findings into 'confirmed facts' and 'information still needed'. When evidence is insufficient, do not give a definitive conclusion — state what is missing and where to get it."
+      },
+      "scenario": {
+        "zh": "线上问题排查、根因分析、复盘",
+        "en": "Production incident triage, root-cause analysis, postmortems"
+      }
+    },
+    {
+      "id": "ai_overwrite_on_feedback",
+      "label": {
+        "zh": "收到一条反馈就大面积重写（改一个丢三个）",
+        "en": "Rewriting broadly in response to one piece of feedback"
+      },
+      "detection": "疯了一样改|把.{0,8}(好的|其他).{0,8}(改坏|删|动了)|之前不是好好的|我只(让|要)你改|其他.{0,4}(不(要|用)动|别动)|为什么.{0,6}(把|连).{0,8}也(改|删)|why did you (change|rewrite|touch)|only asked.{0,15}(one|this)",
+      "root_cause": {
+        "zh": "AI 把「修改反馈点」理解为「大刀阔斧重写」，用全量覆盖而非精准替换，缺少「最小化改动」意识。",
+        "en": "The AI reads 'fix the flagged point' as 'rewrite wholesale', overwriting instead of surgically editing — it lacks a minimal-diff instinct."
+      },
+      "fix_rule": {
+        "zh": "收到修改意见后，先确认改动范围并显式声明「其他不动」，用最小化的精准替换而非全量覆盖，保留已验证通过的内容。",
+        "en": "On receiving feedback, confirm the scope and state explicitly what stays untouched. Make the smallest precise edit rather than a full rewrite, preserving already-approved content."
+      },
+      "scenario": {
+        "zh": "迭代文档、迭代代码、按反馈打磨产出",
+        "en": "Iterating on docs, iterating on code, polishing to feedback"
+      }
+    },
+    {
+      "id": "ai_unverified_frontend",
+      "label": {
+        "zh": "前端 / 视觉产出不验证效果就交付",
+        "en": "Shipping frontend / visual output without verifying it"
+      },
+      "detection": "样式.{0,4}(难看|丑|不对|错位)|人(用不了|没法用)|你是瞎|好看吗|好用吗|渲染出来|没(截图|预览|渲染)|布局.{0,4}(乱|错)|looks (bad|ugly|broken)|did you (look|render|preview)",
+      "root_cause": {
+        "zh": "AI 只关注功能逻辑，工具链缺少视觉验证环节（截图/预览），又没主动声明「需要人工验证」，导致样式丑或不可用。",
+        "en": "The AI focuses on functional logic; its toolchain lacks a visual-verification step (screenshot/preview) and it fails to declare that human verification is needed — so output is ugly or unusable."
+      },
+      "fix_rule": {
+        "zh": "生成或修改前端/视觉产出后，必须验证渲染效果。无法截图/预览时，显式声明「样式需要人工验证」，不要默认它对。",
+        "en": "After producing or changing frontend/visual output, verify how it renders. When you cannot screenshot/preview, state explicitly that the styling needs human verification — do not assume it is correct."
+      },
+      "scenario": {
+        "zh": "前端开发、UI 调整、生成图表 / 可视化",
+        "en": "Frontend work, UI tweaks, generating charts / visualizations"
+      }
+    },
+    {
+      "id": "ai_incomplete_cleanup",
+      "label": {
+        "zh": "变更后遗留代码清理不彻底",
+        "en": "Incomplete cleanup after a change"
+      },
+      "detection": "为什么还有|(过程|废弃|遗留)代码.{0,6}(保留|干什么|还在)|不能统一.{0,4}枚举|没删(干净|完)|残留|散落|magic (number|constant)|dead code|why is .{0,15}still (here|there)|leftover",
+      "root_cause": {
+        "zh": "AI 聚焦于「加新功能」而忽略「清理旧代码」，只改主路径，没做全局一致性检查，留下废弃注释/import/常量。",
+        "en": "The AI focuses on adding functionality and neglects removing old code — it changes the main path but skips a global consistency pass, leaving dead comments/imports/constants."
+      },
+      "fix_rule": {
+        "zh": "代码变更后做一次全局检查：删除废弃的 import / 注释 / 常量 / 过程代码，把散落的魔法值统一收敛，确保全局一致。",
+        "en": "After a code change, do a global pass: remove dead imports/comments/constants/scaffolding and consolidate scattered magic values, ensuring project-wide consistency."
+      },
+      "scenario": {
+        "zh": "重构、删功能 / 删实验、迁移",
+        "en": "Refactoring, removing features/experiments, migrations"
+      }
+    },
+    {
+      "id": "ai_unreadable_output",
+      "label": {
+        "zh": "输出用抽象代号 / 怪格式，用户看不懂",
+        "en": "Output uses abstract placeholders the user can't parse"
+      },
+      "detection": "看不懂|不知道你在说(什么|啥)|驴唇不对马嘴|(这是|什么)东西|你在讲什么|别用.{0,6}(代号|缩写)|(方案|选项)\\s*[A-Zxy一二三]\\b|what (are you|do you mean)|makes no sense|can'?t follow",
+      "root_cause": {
+        "zh": "AI 在内部推理时用了缩写代号（X/Y/方案一），直接暴露到输出，没有展开成用户能懂的具体名称。",
+        "en": "The AI carries internal shorthand (X/Y/'option 1') straight into its output instead of expanding it into concrete names the user can understand."
+      },
+      "fix_rule": {
+        "zh": "输出中禁止用抽象代号提问或做选择。每个选项 / 概念用具体名称完整列出，让用户不用回翻上文就能看懂。",
+        "en": "Never ask questions or present choices using abstract placeholders. Spell out each option/concept by its concrete name so the user understands without scrolling back."
+      },
+      "scenario": {
+        "zh": "给用户做选择、汇报、解释方案",
+        "en": "Offering choices, reporting, explaining options"
+      }
+    }
+  ]
+}
